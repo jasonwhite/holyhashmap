@@ -17,12 +17,13 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
+use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
+use std::iter::FromIterator;
 use std::mem;
 use std::slice;
-use std::borrow::Borrow;
-use std::iter::FromIterator;
+use std::ops::Index;
 
 /// > Holy hash maps, Batman!
 /// > -- <cite>Robin</cite>
@@ -50,10 +51,12 @@ where
     K: Eq + Hash,
     S: BuildHasher,
 {
+    #[inline]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -71,8 +74,45 @@ where
     }
 
     #[inline]
+    pub fn get_index<Q>(&self, key: &Q) -> Option<usize>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        self.inner.get_index(key)
+    }
+
+    #[inline]
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        self.get(key).is_some()
+    }
+
+    #[inline]
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        self.inner.get(key)
+    }
+
+    #[inline]
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        self.inner.insert(key, value)
+        self.inner.insert_index(key, value).1
+    }
+
+    #[inline]
+    pub fn insert_index(&mut self, key: K, value: V) -> (usize, Option<V>) {
+        self.inner.insert_index(key, value)
+    }
+
+    #[inline]
+    pub fn remove_index(&mut self, index: usize) -> (K, V) {
+        self.inner.remove_index(index)
     }
 
     #[inline]
@@ -84,13 +124,15 @@ where
         self.remove_entry(k).map(|(_, v)| v)
     }
 
-    #[inline]
     pub fn remove_entry<Q>(&mut self, k: &Q) -> Option<(K, V)>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.inner.remove_entry(k)
+        match self.inner.get_index(k) {
+            Some(index) => Some(self.remove_index(index)),
+            None => None,
+        }
     }
 
     #[inline]
@@ -121,7 +163,7 @@ where
 {
     fn extend<I>(&mut self, iter: I)
     where
-        I: IntoIterator<Item = (K, V)>
+        I: IntoIterator<Item = (K, V)>,
     {
         let iter = iter.into_iter();
         let _reserve = if self.is_empty() {
@@ -130,7 +172,7 @@ where
             (iter.size_hint().0 + 1) / 2
         };
 
-        //self.reserve(reserve);
+        // self.reserve(reserve);
 
         for (k, v) in iter {
             self.insert(k, v);
@@ -138,12 +180,35 @@ where
     }
 }
 
+impl<'a, K, Q, V, S> Index<&'a Q> for HolyHashMap<K, V, S>
+where
+    K: Eq + Hash + Borrow<Q>,
+    Q: Eq + ?Sized,
+    S: BuildHasher
+{
+    type Output = V;
+
+    #[inline]
+    fn index(&self, key: &Q) -> &Self::Output {
+        self.get(key).expect("no entry found for key")
+    }
+}
+
+impl<'a, K, V, S> IntoIterator for &'a HolyHashMap<K, V, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+{
+    type Item = (&'a K, &'a V);
+    type IntoIter = Iter<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Bucket<K, V> {
-    // An empty bucket that has never had an entry. Probing stops on an empty
-    // bucket, but not on a tombstone or entry.
-    //Empty,
-
     /// A tombstone indicates that the entry has been deleted and can be
     /// reused. The tombstone points to the previous tombstone.
     Tombstone(Option<usize>),
@@ -206,18 +271,13 @@ impl<K, V> InnerMap<K, V> {
         }
     }
 
-    fn replace_entry(
-        &mut self,
-        index: usize,
-        bucket: Bucket<K, V>,
-    ) -> (K, V) {
+    fn replace_entry(&mut self, index: usize, bucket: Bucket<K, V>) -> (K, V) {
         match self.replace_bucket(index, bucket) {
             Bucket::Entry(k, v) => (k, v),
             _ => unreachable!(),
         }
     }
 }
-
 
 impl<K, V> InnerMap<K, V>
 where
@@ -242,11 +302,30 @@ where
         None
     }
 
-    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        for bucket in &self.buckets {
+            match bucket {
+                Bucket::Entry(k, v) => {
+                    if k.borrow() == key {
+                        return Some(v);
+                    }
+                }
+                _ => continue,
+            }
+        }
+
+        None
+    }
+
+    pub fn insert_index(&mut self, key: K, value: V) -> (usize, Option<V>) {
         match self.get_index(&key) {
             Some(index) => {
-                Some(self.replace_entry(index, Bucket::Entry(key, value)).1)
-            },
+                (index, Some(self.replace_entry(index, Bucket::Entry(key, value)).1))
+            }
             None => {
                 match self.last_tombstone {
                     Some(tombstone) => {
@@ -256,32 +335,24 @@ where
                             Bucket::Entry(key, value),
                         );
                         self.tombstones -= 1;
-                        None
+                        (tombstone, None)
                     }
                     None => {
                         // Insert a new value.
+                        let index = self.buckets.len();
                         self.buckets.push(Bucket::Entry(key, value));
-                        None
+                        (index, None)
                     }
                 }
             }
         }
     }
 
-    pub fn remove_entry<Q>(&mut self, k: &Q) -> Option<(K, V)>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        match self.get_index(k) {
-            Some(index) => {
-                let tombstone = self.last_tombstone;
-                self.last_tombstone = Some(index);
-                self.tombstones += 1;
-                Some(self.replace_entry(index, Bucket::Tombstone(tombstone)))
-            }
-            None => None,
-        }
+    pub fn remove_index(&mut self, index: usize) -> (K, V) {
+        let tombstone = self.last_tombstone;
+        self.last_tombstone = Some(index);
+        self.tombstones += 1;
+        self.replace_entry(index, Bucket::Tombstone(tombstone))
     }
 
     pub fn iter(&self) -> Iter<K, V> {
@@ -307,8 +378,8 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
                 Bucket::Tombstone(_) => {
                     self.tombstones -= 1;
                     None
-                },
-            }
+                }
+            },
             None => None,
         }
     }
@@ -328,15 +399,15 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
             self.iter.nth(n).map(Bucket::kv)
         } else {
             let tombstones = &mut self.tombstones;
-            self.iter.by_ref().filter_map(move |bucket| {
-                match bucket {
+            self.iter
+                .by_ref()
+                .filter_map(move |bucket| match bucket {
                     Bucket::Entry(k, v) => Some((k, v)),
                     Bucket::Tombstone(_) => {
                         *tombstones -= 1;
                         None
                     }
-                }
-            }).nth(n)
+                }).nth(n)
         }
     }
 
@@ -359,8 +430,8 @@ impl<'a, K, V> DoubleEndedIterator for Iter<'a, K, V> {
                 Bucket::Tombstone(_) => {
                     self.tombstones -= 1;
                     None
-                },
-            }
+                }
+            },
             None => None,
         }
     }
@@ -370,9 +441,137 @@ impl<'a, K, V> DoubleEndedIterator for Iter<'a, K, V> {
 mod test {
     use super::*;
 
+    // Simplify the type name so that we can use the exact same tests as std's
+    // HashMap.
+    type HashMap<K, V> = HolyHashMap<K, V>;
+
+    #[test]
+    fn test_create_capacity_zero() {
+        let mut m = HashMap::with_capacity(0);
+
+        assert!(m.insert(1, 1).is_none());
+
+        assert!(m.contains_key(&1));
+        assert!(!m.contains_key(&0));
+    }
+
     #[test]
     fn test_insert() {
-        let mut m = HolyHashMap::new();
+        let mut m = HashMap::new();
+        assert_eq!(m.len(), 0);
+        assert!(m.insert(1, 2).is_none());
+        assert_eq!(m.len(), 1);
+        assert!(m.insert(2, 4).is_none());
+        assert_eq!(m.len(), 2);
+        assert_eq!(*m.get(&1).unwrap(), 2);
+        assert_eq!(*m.get(&2).unwrap(), 4);
+    }
+
+    #[test]
+    fn test_clone() {
+        let mut m = HashMap::new();
+        assert_eq!(m.len(), 0);
+        assert!(m.insert(1, 2).is_none());
+        assert_eq!(m.len(), 1);
+        assert!(m.insert(2, 4).is_none());
+        assert_eq!(m.len(), 2);
+        let m2 = m.clone();
+        assert_eq!(*m2.get(&1).unwrap(), 2);
+        assert_eq!(*m2.get(&2).unwrap(), 4);
+        assert_eq!(m2.len(), 2);
+    }
+
+    #[test]
+    fn test_iterate() {
+        let mut m = HashMap::with_capacity(4);
+        for i in 0..32 {
+            assert!(m.insert(i, i*2).is_none());
+        }
+        assert_eq!(m.len(), 32);
+
+        let mut observed: u32 = 0;
+
+        for (k, v) in &m {
+            assert_eq!(*v, *k * 2);
+            observed |= 1 << *k;
+        }
+        assert_eq!(observed, 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn test_find() {
+        let mut m = HashMap::new();
+        assert!(m.get(&1).is_none());
+        m.insert(1, 2);
+        match m.get(&1) {
+            None => panic!(),
+            Some(v) => assert_eq!(*v, 2),
+        }
+    }
+
+    #[test]
+    fn test_from_iter() {
+        let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
+
+        let map: HashMap<_, _> = xs.iter().cloned().collect();
+
+        for &(k, v) in &xs {
+            assert_eq!(map.get(&k), Some(&v));
+        }
+    }
+
+    #[test]
+    fn test_size_hint() {
+        let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
+
+        let map: HashMap<_, _> = xs.iter().cloned().collect();
+
+        let mut iter = map.iter();
+
+        for _ in iter.by_ref().take(3) {}
+
+        assert_eq!(iter.size_hint(), (3, Some(3)));
+    }
+
+    #[test]
+    fn test_iter_len() {
+        let xs = [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
+
+        let map: HashMap<_, _> = xs.iter().cloned().collect();
+
+        let mut iter = map.iter();
+
+        for _ in iter.by_ref().take(3) {}
+
+        assert_eq!(iter.len(), 3);
+    }
+
+    #[test]
+    fn test_index() {
+        let mut map = HashMap::new();
+
+        map.insert(1, 2);
+        map.insert(2, 1);
+        map.insert(3, 4);
+
+        assert_eq!(map[&2], 1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_index_nonexistent() {
+        let mut map = HashMap::new();
+
+        map.insert(1, 2);
+        map.insert(2, 1);
+        map.insert(3, 4);
+
+        map[&4];
+    }
+
+    #[test]
+    fn insert() {
+        let mut m = HashMap::new();
         assert_eq!(m.len(), 0);
         assert!(m.insert(1, 2).is_none());
         assert_eq!(m.len(), 1);
@@ -383,12 +582,17 @@ mod test {
     }
 
     #[test]
-    fn test_remove() {
-        let mut m = HolyHashMap::new();
+    fn remove() {
+        let mut m = HashMap::new();
         assert!(m.insert(1, 2).is_none());
         assert!(m.insert(2, 4).is_none());
         assert_eq!(m.len(), 2);
         assert_eq!(m.remove(&2), Some(4));
         assert_eq!(m.len(), 1);
+        assert_eq!(m.remove(&2), None);
+        assert_eq!(m.len(), 1);
+        assert!(m.insert(2, 4).is_none());
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.remove_entry(&2), Some((2, 4)));
     }
 }
