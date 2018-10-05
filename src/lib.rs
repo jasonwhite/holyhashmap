@@ -46,9 +46,9 @@ impl HashValue {
 
     /// Returns the index into which this hash value should go given an array
     /// length.
-    pub fn index(&self, len: usize) -> usize {
-        debug_assert!(len.is_power_of_two());
-        (self.0 & (len as u64).wrapping_sub(1)) as usize
+    pub fn index(&self, mask: usize) -> usize {
+        debug_assert!((mask + 1).is_power_of_two());
+        (self.0 & mask as u64) as usize
     }
 }
 
@@ -128,7 +128,7 @@ where
     pub fn get_index<Q>(&self, key: &Q) -> Option<usize>
     where
         K: Borrow<Q>,
-        Q: Eq + ?Sized,
+        Q: Hash + Eq + ?Sized,
     {
         self.inner.get_index(key)
     }
@@ -137,7 +137,7 @@ where
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
-        Q: Eq + ?Sized,
+        Q: Hash + Eq + ?Sized,
     {
         self.get(key).is_some()
     }
@@ -146,19 +146,20 @@ where
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
-        Q: Eq + ?Sized,
+        Q: Hash + Eq + ?Sized,
     {
         self.inner.get(key)
     }
 
     #[inline]
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        self.inner.insert_index(key, value).1
+        self.insert_index(key, value).1
     }
 
     #[inline]
     pub fn insert_index(&mut self, key: K, value: V) -> (usize, Option<V>) {
-        self.inner.insert_index(key, value)
+        let hash = HashValue::new(&self.hash_builder, &key);
+        self.inner.insert_index(hash, key, value)
     }
 
     #[inline]
@@ -234,7 +235,7 @@ where
 impl<'a, K, Q, V, S> Index<&'a Q> for HolyHashMap<K, V, S>
 where
     K: Eq + Hash + Borrow<Q>,
-    Q: Eq + ?Sized,
+    Q: Eq + Hash + ?Sized,
     S: BuildHasher,
 {
     type Output = V;
@@ -300,9 +301,29 @@ impl Bucket {
     }
 }
 
+/// A tombstone.
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct Tombstone(usize);
+
+impl Tombstone {
+    const HEAD: Tombstone = Tombstone(usize::max_value());
+
+    pub fn new(prev: usize) -> Self {
+        Tombstone(prev)
+    }
+
+    pub fn is_head(&self) -> bool {
+        self == &Self::HEAD
+    }
+}
+
 /// A bucket entry. `None` if the entry has been deleted (i.e., it is
 /// a tombstone).
-type BucketEntry<K, V> = Option<(K, V)>;
+#[derive(Debug, Clone)]
+enum BucketEntry<K, V> {
+    Tombstone(Tombstone),
+    Entry(K, V),
+}
 
 #[derive(Clone)]
 struct InnerMap<K, V> {
@@ -312,27 +333,30 @@ struct InnerMap<K, V> {
     //
     // The length of this vector must always be a power of 2 such that we can
     // use the &-operator to index into it (AND is faster than MOD).
-    buckets: Box<[Bucket]>,
+    buckets: Vec<Bucket>,
 
     // The actual data. Key-value pairs are pushed onto the end of the vector.
     // The entires are guaranteed to not change position in the vector upon
     // insertion or deletion.
-    //
-    // An entry is `None` if it has been deleted (i.e., it is a tombstone).
     entries: Vec<BucketEntry<K, V>>,
 
     // The number of tombstones in the table (i.e., the number of non-`None`
     // values in `entries`). This is useful to give an accurate length of the
     // table.
     tombstones: usize,
+
+    // Index of the last tombstone. This is used to reclaim deleted entries
+    // such that indices are not invalidated upon removals.
+    last_tombstone: Tombstone,
 }
 
 impl<K, V> InnerMap<K, V> {
     pub fn with_capacity(n: usize) -> Self {
         InnerMap {
-            buckets: vec![Bucket::EMPTY; n].into_boxed_slice(),
+            buckets: vec![Bucket::EMPTY; n],
             entries: Vec::new(),
             tombstones: 0,
+            last_tombstone: Tombstone::HEAD,
         }
     }
 
@@ -346,25 +370,41 @@ impl<K, V> InnerMap<K, V> {
 
     /// The number of entries that can be stored without resizing.
     pub fn max_load(&self) -> usize {
-        // Max load of 50%.
+        // Max load factor of 50%.
         self.capacity() / 2
     }
 
+    // Double the capacity of the buckets. This filters out all bucket
+    // tombstones.
     pub fn double_capacity(&mut self) {
         let new_capacity = self.capacity() * 2;
 
-        let old_buckets = mem::replace(
-            &mut self.buckets,
-            vec![Bucket::EMPTY; new_capacity].into_boxed_slice(),
-        );
+        let old_buckets =
+            mem::replace(&mut self.buckets, vec![Bucket::EMPTY; new_capacity]);
+
+        let mask = new_capacity.wrapping_sub(1);
 
         // For each old bucket, reinsert it into the new buckets at the right
         // spot.
-        for bucket in old_buckets.into_iter() {
-            if bucket.is_tombstone() {
-                // TODO: 
+        for bucket in old_buckets {
+            if bucket.is_empty() || bucket.is_tombstone() {
+                continue;
             }
-            let pos = bucket.hash.index(new_capacity);
+
+            let mut index = bucket.hash.index(new_capacity);
+
+            // Probe for an empty bucket and place it there.
+            loop {
+                let mut candidate = self.buckets.get_mut(index).unwrap();
+
+                if candidate.is_empty() {
+                    *candidate = bucket;
+                    break;
+                }
+
+                // Wrap around to the beginning of the array if necessary.
+                index = index.wrapping_add(1) & mask;
+            }
         }
     }
 
@@ -378,7 +418,7 @@ impl<K, V> InnerMap<K, V> {
 
 impl<K, V> InnerMap<K, V>
 where
-    K: Eq,
+    K: Hash + Eq,
 {
     pub fn get_index<Q>(&self, key: &Q) -> Option<usize>
     where
@@ -388,28 +428,53 @@ where
         None
     }
 
-    /// Returns the index of the given key.
-    pub fn search<Q>(&self, hash: HashValue, key: &Q) -> Option<usize>
+    /// Returns an index to a bucket where an entry has been found or can be
+    /// inserted at.
+    pub fn search<Q>(&self, hash: HashValue, key: &Q) -> usize
     where
         K: Borrow<Q>,
-        Q: Eq + ?Sized,
+        Q: Hash + Eq + ?Sized,
     {
-        // TODO: Use hash value to key into the buckets. Probe until we find the
-        // right key. Stop probing if we hit an empty bucket. Skip over
-        // tombstones.
+        let mask = self.capacity().wrapping_sub(1);
+        let mut index = hash.index(mask);
 
-        None
+        loop {
+            let bucket = self.buckets.get(index).unwrap();
+
+            if bucket.is_empty() {
+                return index;
+            } else if bucket.is_tombstone() {
+                // Skip over tombstones.
+                continue;
+            } else if bucket.hash == hash {
+                // The hash matches. Make sure the key actually matches.
+                match self.entries.get(bucket.index).unwrap() {
+                    BucketEntry::Entry(k, _) => {
+                        if k.borrow() == key {
+                            return index;
+                        }
+                    }
+                    _ => unreachable!(), // This should be impossible.
+                }
+            }
+
+            // Wrap around to the beginning of the array if necessary.
+            index = index.wrapping_add(1) & mask;
+        }
     }
 
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
-        Q: Eq + ?Sized,
+        Q: Hash + Eq + ?Sized,
     {
         None
     }
 
-    pub fn insert_index(&mut self, key: K, value: V) -> (usize, Option<V>) {
+    pub fn insert_index(&mut self, hash: HashValue, key: K, value: V) -> (usize, Option<V>) {
+        let mask = self.capacity().wrapping_sub(1);
+        let index = hash.index(mask);
+
         (0, None)
     }
 
@@ -434,8 +499,8 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(entry) = self.iter.next() {
             match entry {
-                Some((k, v)) => return Some((&k, &v)),
-                None => {}
+                BucketEntry::Entry(k, v) => return Some((&k, &v)),
+                BucketEntry::Tombstone(_) => {}
             }
         }
 
