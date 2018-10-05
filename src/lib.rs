@@ -18,12 +18,39 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 use std::borrow::Borrow;
+use std::cmp::max;
 use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hash};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::iter::FromIterator;
 use std::mem;
-use std::slice;
 use std::ops::Index;
+use std::slice;
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+struct HashValue(u64);
+
+impl HashValue {
+    pub fn new<T, S>(state: &S, t: &T) -> Self
+    where
+        T: Hash + ?Sized,
+        S: BuildHasher,
+    {
+        let mut hasher = state.build_hasher();
+        t.hash(&mut hasher);
+        HashValue(hasher.finish())
+    }
+
+    pub fn zero() -> Self {
+        HashValue(0)
+    }
+
+    /// Returns the index into which this hash value should go given an array
+    /// length.
+    pub fn index(&self, len: usize) -> usize {
+        debug_assert!(len.is_power_of_two());
+        (self.0 & (len as u64).wrapping_sub(1)) as usize
+    }
+}
 
 /// > Holy hash maps, Batman!
 /// > -- <cite>Robin</cite>
@@ -61,16 +88,40 @@ where
         self.len() == 0
     }
 
+    #[inline]
+    pub fn with_hasher(hash_builder: S) -> Self {
+        Self::with_capacity_and_hasher(0, hash_builder)
+    }
+
     pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> Self {
+        let capacity = if capacity == 0 {
+            0
+        } else {
+            // Always use a power-of-two capacity so that we can use `&` instead
+            // of `%` for determining the bucket.
+            //
+            // Double the user-supplied capacity to maintain the max load
+            // factor.
+            max(32, (capacity * 2).next_power_of_two())
+        };
+
         HolyHashMap {
             hash_builder,
             inner: InnerMap::with_capacity(capacity),
         }
     }
 
-    #[inline]
-    pub fn with_hasher(hash_builder: S) -> Self {
-        Self::with_capacity_and_hasher(0, hash_builder)
+    pub fn hasher(&self) -> &S {
+        &self.hash_builder
+    }
+
+    pub fn capacity(&self) -> usize {
+        // Capacity when the max load factor is taken into account.
+        self.inner.max_load()
+    }
+
+    pub fn reserve(&mut self, additional: usize) {
+        self.inner.reserve(additional);
     }
 
     #[inline]
@@ -184,7 +235,7 @@ impl<'a, K, Q, V, S> Index<&'a Q> for HolyHashMap<K, V, S>
 where
     K: Eq + Hash + Borrow<Q>,
     Q: Eq + ?Sized,
-    S: BuildHasher
+    S: BuildHasher,
 {
     type Output = V;
 
@@ -207,74 +258,120 @@ where
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum Bucket<K, V> {
-    /// A tombstone indicates that the entry has been deleted and can be
-    /// reused. The tombstone points to the previous tombstone.
-    Tombstone(Option<usize>),
+const BUCKET_EMPTY: usize = usize::max_value();
+const BUCKET_TOMBSTONE: usize = usize::max_value() - 1;
 
-    /// A valid entry.
-    Entry(K, V),
+/// A bucket in the hash map. This doesn't actually store the key-value pair, it
+/// points a vector that contains the key-value pair. This indirection helps
+/// with cache locality and enables stable indices.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Bucket {
+    /// The hash of the key. While not strictly necessary to store this here,
+    /// we can use this to simplify rehashing and to make faster key
+    /// comparisons. If the hash value matches, then we verify equality by
+    /// doing a comparison on the real key.
+    hash: HashValue,
+
+    /// The index into the vector of entries.
+    index: usize,
 }
 
-impl<K, V> Bucket<K, V> {
-    pub fn kv(&self) -> (&K, &V) {
-        match self {
-            Bucket::Entry(k, v) => (k, v),
-            _ => unreachable!(),
-        }
+impl Bucket {
+    pub const EMPTY: Bucket = Bucket {
+        hash: HashValue(0),
+        index: BUCKET_EMPTY,
+    };
+    pub const TOMBSTONE: Bucket = Bucket {
+        hash: HashValue(0),
+        index: BUCKET_TOMBSTONE,
+    };
+
+    /// Creates a bucket with the given index and hash value.
+    pub fn new(hash: HashValue, index: usize) -> Self {
+        Bucket { hash, index }
+    }
+
+    pub fn is_tombstone(&self) -> bool {
+        self == &Self::EMPTY
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self == &Self::TOMBSTONE
     }
 }
 
+/// A bucket entry. `None` if the entry has been deleted (i.e., it is
+/// a tombstone).
+type BucketEntry<K, V> = Option<(K, V)>;
+
 #[derive(Clone)]
 struct InnerMap<K, V> {
-    // Buckets.
-    buckets: Vec<Bucket<K, V>>,
+    // The buckets. This is the vector we do linear probing on. When the
+    // correct bucket is found, we use it to index into the vector of
+    // entries.
+    //
+    // The length of this vector must always be a power of 2 such that we can
+    // use the &-operator to index into it (AND is faster than MOD).
+    buckets: Box<[Bucket]>,
 
-    // The last tombstone in the table. This forms a singly linked list that
-    // can be used to find unused buckets.
-    last_tombstone: Option<usize>,
+    // The actual data. Key-value pairs are pushed onto the end of the vector.
+    // The entires are guaranteed to not change position in the vector upon
+    // insertion or deletion.
+    //
+    // An entry is `None` if it has been deleted (i.e., it is a tombstone).
+    entries: Vec<BucketEntry<K, V>>,
 
-    // The number of tombstones in the table.
+    // The number of tombstones in the table (i.e., the number of non-`None`
+    // values in `entries`). This is useful to give an accurate length of the
+    // table.
     tombstones: usize,
 }
 
 impl<K, V> InnerMap<K, V> {
     pub fn with_capacity(n: usize) -> Self {
         InnerMap {
-            buckets: Vec::with_capacity(n),
-            last_tombstone: None,
+            buckets: vec![Bucket::EMPTY; n].into_boxed_slice(),
+            entries: Vec::new(),
             tombstones: 0,
         }
     }
 
     pub fn len(&self) -> usize {
-        self.buckets.len() - self.tombstones
+        self.entries.len() - self.tombstones
     }
 
-    fn replace_bucket(
-        &mut self,
-        index: usize,
-        bucket: Bucket<K, V>,
-    ) -> Bucket<K, V> {
-        mem::replace(self.buckets.get_mut(index).unwrap(), bucket)
+    pub fn capacity(&self) -> usize {
+        self.buckets.len()
     }
 
-    fn replace_tombstone(
-        &mut self,
-        index: usize,
-        bucket: Bucket<K, V>,
-    ) -> Option<usize> {
-        match self.replace_bucket(index, bucket) {
-            Bucket::Tombstone(x) => x,
-            _ => unreachable!(),
+    /// The number of entries that can be stored without resizing.
+    pub fn max_load(&self) -> usize {
+        // Max load of 50%.
+        self.capacity() / 2
+    }
+
+    pub fn double_capacity(&mut self) {
+        let new_capacity = self.capacity() * 2;
+
+        let old_buckets = mem::replace(
+            &mut self.buckets,
+            vec![Bucket::EMPTY; new_capacity].into_boxed_slice(),
+        );
+
+        // For each old bucket, reinsert it into the new buckets at the right
+        // spot.
+        for bucket in old_buckets.into_iter() {
+            if bucket.is_tombstone() {
+                // TODO: 
+            }
+            let pos = bucket.hash.index(new_capacity);
         }
     }
 
-    fn replace_entry(&mut self, index: usize, bucket: Bucket<K, V>) -> (K, V) {
-        match self.replace_bucket(index, bucket) {
-            Bucket::Entry(k, v) => (k, v),
-            _ => unreachable!(),
+    pub fn reserve(&mut self, additional: usize) {
+        let new_size = self.len() + additional;
+        if new_size > self.capacity() {
+            self.double_capacity()
         }
     }
 }
@@ -288,16 +385,18 @@ where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
-        for (i, bucket) in self.buckets.iter().enumerate() {
-            match bucket {
-                Bucket::Entry(k, _) => {
-                    if k.borrow() == key {
-                        return Some(i);
-                    }
-                }
-                _ => continue,
-            }
-        }
+        None
+    }
+
+    /// Returns the index of the given key.
+    pub fn search<Q>(&self, hash: HashValue, key: &Q) -> Option<usize>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        // TODO: Use hash value to key into the buckets. Probe until we find the
+        // right key. Stop probing if we hit an empty bucket. Skip over
+        // tombstones.
 
         None
     }
@@ -307,133 +406,40 @@ where
         K: Borrow<Q>,
         Q: Eq + ?Sized,
     {
-        for bucket in &self.buckets {
-            match bucket {
-                Bucket::Entry(k, v) => {
-                    if k.borrow() == key {
-                        return Some(v);
-                    }
-                }
-                _ => continue,
-            }
-        }
-
         None
     }
 
     pub fn insert_index(&mut self, key: K, value: V) -> (usize, Option<V>) {
-        match self.get_index(&key) {
-            Some(index) => {
-                (index, Some(self.replace_entry(index, Bucket::Entry(key, value)).1))
-            }
-            None => {
-                match self.last_tombstone {
-                    Some(tombstone) => {
-                        // Reuse a tombstone
-                        self.last_tombstone = self.replace_tombstone(
-                            tombstone,
-                            Bucket::Entry(key, value),
-                        );
-                        self.tombstones -= 1;
-                        (tombstone, None)
-                    }
-                    None => {
-                        // Insert a new value.
-                        let index = self.buckets.len();
-                        self.buckets.push(Bucket::Entry(key, value));
-                        (index, None)
-                    }
-                }
-            }
-        }
+        (0, None)
     }
 
     pub fn remove_index(&mut self, index: usize) -> (K, V) {
-        let tombstone = self.last_tombstone;
-        self.last_tombstone = Some(index);
-        self.tombstones += 1;
-        self.replace_entry(index, Bucket::Tombstone(tombstone))
+        unimplemented!()
     }
 
     pub fn iter(&self) -> Iter<K, V> {
         Iter {
-            iter: self.buckets.iter(),
-            tombstones: self.tombstones,
+            iter: self.entries.iter(),
         }
     }
 }
 
 pub struct Iter<'a, K: 'a, V: 'a> {
-    iter: slice::Iter<'a, Bucket<K, V>>,
-    tombstones: usize,
+    iter: slice::Iter<'a, BucketEntry<K, V>>,
 }
 
 impl<'a, K, V> Iterator for Iter<'a, K, V> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.iter.next() {
-            Some(entry) => match entry {
-                Bucket::Entry(k, v) => Some((&k, &v)),
-                Bucket::Tombstone(_) => {
-                    self.tombstones -= 1;
-                    None
-                }
-            },
-            None => None,
+        while let Some(entry) = self.iter.next() {
+            match entry {
+                Some((k, v)) => return Some((&k, &v)),
+                None => {}
+            }
         }
-    }
 
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.iter.size_hint()
-    }
-
-    #[inline]
-    fn count(self) -> usize {
-        self.len()
-    }
-
-    fn nth(&mut self, n: usize) -> Option<Self::Item> {
-        if self.tombstones == 0 {
-            self.iter.nth(n).map(Bucket::kv)
-        } else {
-            let tombstones = &mut self.tombstones;
-            self.iter
-                .by_ref()
-                .filter_map(move |bucket| match bucket {
-                    Bucket::Entry(k, v) => Some((k, v)),
-                    Bucket::Tombstone(_) => {
-                        *tombstones -= 1;
-                        None
-                    }
-                }).nth(n)
-        }
-    }
-
-    fn last(mut self) -> Option<Self::Item> {
-        self.next_back()
-    }
-}
-
-impl<'a, K, V> ExactSizeIterator for Iter<'a, K, V> {
-    fn len(&self) -> usize {
-        self.iter.len() - self.tombstones
-    }
-}
-
-impl<'a, K, V> DoubleEndedIterator for Iter<'a, K, V> {
-    fn next_back(&mut self) -> Option<(&'a K, &'a V)> {
-        match self.iter.next_back() {
-            Some(entry) => match entry {
-                Bucket::Entry(k, v) => Some((&k, &v)),
-                Bucket::Tombstone(_) => {
-                    self.tombstones -= 1;
-                    None
-                }
-            },
-            None => None,
-        }
+        None
     }
 }
 
@@ -485,7 +491,7 @@ mod test {
     fn test_iterate() {
         let mut m = HashMap::with_capacity(4);
         for i in 0..32 {
-            assert!(m.insert(i, i*2).is_none());
+            assert!(m.insert(i, i * 2).is_none());
         }
         assert_eq!(m.len(), 32);
 
