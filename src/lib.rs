@@ -280,6 +280,22 @@ where
     }
 }
 
+impl<K, V, S> IntoIterator for HolyHashMap<K, V, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+{
+    type Item = (K, V);
+    type IntoIter = IntoIter<K, V>;
+
+    fn into_iter(self) -> IntoIter<K, V> {
+        IntoIter {
+            iter: self.inner.entries.into_iter(),
+            tombstones: self.inner.tombstones,
+        }
+    }
+}
+
 const BUCKET_EMPTY: usize = usize::max_value();
 
 /// A bucket in the hash map. This doesn't actually store the key-value pair, it
@@ -716,6 +732,78 @@ impl<'a, K, V> ExactSizeIterator for Iter<'a, K, V> {
     }
 }
 
+#[derive(Clone)]
+pub struct IntoIter<K, V> {
+    iter: ::std::vec::IntoIter<BucketEntry<K, V>>,
+
+    // Number of tombstones in the entries.
+    tombstones: usize,
+}
+
+impl<K, V> Iterator for IntoIter<K, V> {
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(entry) = self.iter.next() {
+            match entry {
+                BucketEntry::Entry(k, v) => return Some((k, v)),
+                BucketEntry::Tombstone(_) => {
+                    self.tombstones -= 1;
+                }
+            }
+        }
+
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+
+    fn count(self) -> usize {
+        self.len()
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        if self.tombstones == 0 {
+            self.iter.nth(n).map(BucketEntry::into_entry)
+        } else {
+            let tombstones = &mut self.tombstones;
+            self.iter
+                .by_ref()
+                .filter_map(move |entry| match entry {
+                    BucketEntry::Entry(k, v) => return Some((k, v)),
+                    BucketEntry::Tombstone(_) => {
+                        *tombstones -= 1;
+                        None
+                    }
+                }).nth(n)
+        }
+    }
+}
+
+impl<K, V> DoubleEndedIterator for IntoIter<K, V> {
+    fn next_back(&mut self) -> Option<(K, V)> {
+        while let Some(entry) = self.iter.next_back() {
+            match entry {
+                BucketEntry::Entry(k, v) => return Some((k, v)),
+                BucketEntry::Tombstone(_) => {
+                    self.tombstones -= 1;
+                }
+            }
+        }
+
+        None
+    }
+}
+
+impl<K, V> ExactSizeIterator for IntoIter<K, V> {
+    fn len(&self) -> usize {
+        self.iter.len() - self.tombstones
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -795,8 +883,9 @@ mod test {
         assert_eq!(m2.len(), 2);
     }
 
-
-    thread_local! { static DROP_VECTOR: RefCell<Vec<i32>> = RefCell::new(Vec::new()) }
+    thread_local! {
+        static DROP_VECTOR: RefCell<Vec<i32>> = RefCell::new(Vec::new());
+    }
 
     #[derive(Hash, PartialEq, Eq)]
     struct Droppable {
@@ -862,19 +951,19 @@ mod test {
 
                 DROP_VECTOR.with(|v| {
                     assert_eq!(v.borrow()[i], 1);
-                    assert_eq!(v.borrow()[i+100], 1);
+                    assert_eq!(v.borrow()[i + 100], 1);
                 });
             }
 
             DROP_VECTOR.with(|v| {
                 for i in 0..50 {
                     assert_eq!(v.borrow()[i], 0);
-                    assert_eq!(v.borrow()[i+100], 0);
+                    assert_eq!(v.borrow()[i + 100], 0);
                 }
 
                 for i in 50..100 {
                     assert_eq!(v.borrow()[i], 1);
-                    assert_eq!(v.borrow()[i+100], 1);
+                    assert_eq!(v.borrow()[i + 100], 1);
                 }
             });
         }
@@ -931,13 +1020,9 @@ mod test {
             for _ in half.by_ref() {}
 
             DROP_VECTOR.with(|v| {
-                let nk = (0..100)
-                    .filter(|&i| v.borrow()[i] == 1)
-                    .count();
+                let nk = (0..100).filter(|&i| v.borrow()[i] == 1).count();
 
-                let nv = (0..100)
-                    .filter(|&i| v.borrow()[i + 100] == 1)
-                    .count();
+                let nv = (0..100).filter(|&i| v.borrow()[i + 100] == 1).count();
 
                 assert_eq!(nk, 50);
                 assert_eq!(nv, 50);
