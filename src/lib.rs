@@ -135,11 +135,11 @@ where
     {
         if self.is_empty() {
             // Can't compute hash for empty map.
-            None
-        } else {
-            let hash = HashValue::new(&self.hash_builder, &key);
-            self.inner.get_index(hash, key)
+            return None
         }
+
+        let hash = HashValue::new(&self.hash_builder, &key);
+        self.inner.get_index(hash, key)
     }
 
     #[inline]
@@ -159,11 +159,11 @@ where
     {
         if self.is_empty() {
             // Can't compute hash for empty map.
-            None
-        } else {
-            let hash = HashValue::new(&self.hash_builder, &key);
-            self.inner.get_entry(hash, key).map(second)
+            return None
         }
+
+        let hash = HashValue::new(&self.hash_builder, &key);
+        self.inner.get_entry(hash, key).map(second)
     }
 
     #[inline]
@@ -194,6 +194,11 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        if self.is_empty() {
+            // Can't compute hash for empty map.
+            return None
+        }
+
         let hash = HashValue::new(&self.hash_builder, &key);
         self.inner.remove(hash, key)
     }
@@ -1034,6 +1039,12 @@ mod test {
                 assert_eq!(v.borrow()[i], 0);
             }
         });
+    }
+
+    #[test]
+    fn test_empty_remove() {
+        let mut m: HashMap<i32, bool> = HashMap::new();
+        assert_eq!(m.remove(&0), None);
     }
 
     #[test]
