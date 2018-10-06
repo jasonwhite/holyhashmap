@@ -40,16 +40,18 @@ impl HashValue {
         HashValue(hasher.finish())
     }
 
-    pub fn zero() -> Self {
-        HashValue(0)
-    }
-
     /// Returns the index into which this hash value should go given an array
     /// length.
     pub fn index(&self, mask: usize) -> usize {
-        debug_assert!((mask + 1).is_power_of_two());
+        debug_assert!(mask.wrapping_add(1).is_power_of_two(), format!("invalid mask {:x?}", mask));
         (self.0 & mask as u64) as usize
     }
+}
+
+// Helper function for getting the second element in a tuple without generating
+// a lambda function.
+fn second<K, V>(kv: (K, V)) -> V {
+    kv.1
 }
 
 /// > Holy hash maps, Batman!
@@ -94,17 +96,6 @@ where
     }
 
     pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> Self {
-        let capacity = if capacity == 0 {
-            0
-        } else {
-            // Always use a power-of-two capacity so that we can use `&` instead
-            // of `%` for determining the bucket.
-            //
-            // Double the user-supplied capacity to maintain the max load
-            // factor.
-            max(32, (capacity * 2).next_power_of_two())
-        };
-
         HolyHashMap {
             hash_builder,
             inner: InnerMap::with_capacity(capacity),
@@ -130,7 +121,13 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.inner.get_index(key)
+        if self.is_empty() {
+            // Can't compute hash for empty map.
+            None
+        } else {
+            let hash = HashValue::new(&self.hash_builder, &key);
+            self.inner.get_index(hash, key)
+        }
     }
 
     #[inline]
@@ -148,23 +145,27 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.inner.get(key)
+        if self.is_empty() {
+            // Can't compute hash for empty map.
+            None
+        } else {
+            let hash = HashValue::new(&self.hash_builder, &key);
+            self.inner.get_entry(hash, key).map(second)
+        }
     }
 
     #[inline]
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
-        self.insert_index(key, value).1
+        self.insert_full(key, value).1
     }
 
     #[inline]
-    pub fn insert_index(&mut self, key: K, value: V) -> (usize, Option<V>) {
+    pub fn insert_full(&mut self, key: K, value: V) -> (usize, Option<V>) {
+        // Must reserve additional space before calculating the hash.
+        self.reserve(1);
+
         let hash = HashValue::new(&self.hash_builder, &key);
-        self.inner.insert_index(hash, key, value)
-    }
-
-    #[inline]
-    pub fn remove_index(&mut self, index: usize) -> (K, V) {
-        self.inner.remove_index(index)
+        self.inner.insert_full(hash, key, value)
     }
 
     #[inline]
@@ -173,18 +174,16 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.remove_entry(k).map(|(_, v)| v)
+        self.remove_entry(k).map(second)
     }
 
-    pub fn remove_entry<Q>(&mut self, k: &Q) -> Option<(K, V)>
+    pub fn remove_entry<Q>(&mut self, key: &Q) -> Option<(K, V)>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        match self.inner.get_index(k) {
-            Some(index) => Some(self.remove_index(index)),
-            None => None,
-        }
+        let hash = HashValue::new(&self.hash_builder, &key);
+        self.inner.remove(hash, key)
     }
 
     #[inline]
@@ -218,13 +217,13 @@ where
         I: IntoIterator<Item = (K, V)>,
     {
         let iter = iter.into_iter();
-        let _reserve = if self.is_empty() {
+        let reserve = if self.is_empty() {
             iter.size_hint().0
         } else {
             (iter.size_hint().0 + 1) / 2
         };
 
-        // self.reserve(reserve);
+        self.reserve(reserve);
 
         for (k, v) in iter {
             self.insert(k, v);
@@ -260,7 +259,6 @@ where
 }
 
 const BUCKET_EMPTY: usize = usize::max_value();
-const BUCKET_TOMBSTONE: usize = usize::max_value() - 1;
 
 /// A bucket in the hash map. This doesn't actually store the key-value pair, it
 /// points a vector that contains the key-value pair. This indirection helps
@@ -282,22 +280,15 @@ impl Bucket {
         hash: HashValue(0),
         index: BUCKET_EMPTY,
     };
-    pub const TOMBSTONE: Bucket = Bucket {
-        hash: HashValue(0),
-        index: BUCKET_TOMBSTONE,
-    };
 
     /// Creates a bucket with the given index and hash value.
     pub fn new(hash: HashValue, index: usize) -> Self {
         Bucket { hash, index }
     }
 
-    pub fn is_tombstone(&self) -> bool {
-        self == &Self::EMPTY
-    }
-
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self == &Self::TOMBSTONE
+        self.index == BUCKET_EMPTY
     }
 }
 
@@ -325,14 +316,40 @@ enum BucketEntry<K, V> {
     Entry(K, V),
 }
 
+impl<K, V> BucketEntry<K, V> {
+    pub fn into_entry(self) -> (K, V) {
+        match self {
+            BucketEntry::Entry(k, v) => (k, v),
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn entry(&self) -> (&K, &V) {
+        match self {
+            BucketEntry::Entry(k, v) => (k, v),
+            _ => unreachable!(),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct InnerMap<K, V> {
+    // The value to `&` with in order to derive the index of a bucket from
+    // a hash value. This is always `capacity - 1` and since capacity is always
+    // a power of two, the mask will be something like `0b1111`. It is faster to
+    // use a bitwise AND than modulus to calculate the index.
+    //
+    // Note that it's not strictly necessary to store this here as it can always
+    // be derived, but it is very convenient and avoids the need to recalculate
+    // it for every table lookup.
+    mask: usize,
+
     // The buckets. This is the vector we do linear probing on. When the
     // correct bucket is found, we use it to index into the vector of
     // entries.
     //
     // The length of this vector must always be a power of 2 such that we can
-    // use the &-operator to index into it (AND is faster than MOD).
+    // use the &-operator to index into it (see `mask` above).
     buckets: Vec<Bucket>,
 
     // The actual data. Key-value pairs are pushed onto the end of the vector.
@@ -351,12 +368,31 @@ struct InnerMap<K, V> {
 }
 
 impl<K, V> InnerMap<K, V> {
-    pub fn with_capacity(n: usize) -> Self {
-        InnerMap {
-            buckets: vec![Bucket::EMPTY; n],
-            entries: Vec::new(),
-            tombstones: 0,
-            last_tombstone: Tombstone::HEAD,
+    pub fn with_capacity(capacity: usize) -> Self {
+        if capacity == 0 {
+            // Don't allocate if the desired capacity is 0.
+            InnerMap {
+                mask: 0,
+                buckets: Vec::new(),
+                entries: Vec::new(),
+                tombstones: 0,
+                last_tombstone: Tombstone::HEAD,
+            }
+        } else {
+            // Always use a power-of-two capacity so that we can use `&` instead
+            // of `%` for determining the bucket.
+            //
+            // Double the user-supplied capacity to maintain the max load
+            // factor.
+            let n = max(32, (capacity * 2).next_power_of_two());
+
+            InnerMap {
+                mask: n.wrapping_sub(1),
+                buckets: vec![Bucket::EMPTY; n],
+                entries: Vec::new(),
+                tombstones: 0,
+                last_tombstone: Tombstone::HEAD,
+            }
         }
     }
 
@@ -374,20 +410,31 @@ impl<K, V> InnerMap<K, V> {
         self.capacity() / 2
     }
 
-    // Double the capacity of the buckets. This filters out all bucket
-    // tombstones.
-    pub fn double_capacity(&mut self) {
-        let new_capacity = self.capacity() * 2;
+    pub fn reserve(&mut self, additional: usize) {
+        let new_size = self.len() + additional;
+        if new_size > self.max_load() {
+            // Grow in terms of physical capacity, not max load.
+            self.grow(new_size * 2)
+        }
+    }
+
+    // Double the capacity of the buckets.
+    //
+    // Invariant: New capacity must be 
+    fn grow(&mut self, capacity: usize) {
+        // This might be our first allocation. Make sure we're not just
+        // multiplying 0 by 2.
+        let new_capacity = max(32, capacity.next_power_of_two());
 
         let old_buckets =
             mem::replace(&mut self.buckets, vec![Bucket::EMPTY; new_capacity]);
 
-        let mask = new_capacity.wrapping_sub(1);
+        self.mask = new_capacity.wrapping_sub(1);
 
         // For each old bucket, reinsert it into the new buckets at the right
         // spot.
         for bucket in old_buckets {
-            if bucket.is_empty() || bucket.is_tombstone() {
+            if bucket.is_empty() {
                 continue;
             }
 
@@ -403,15 +450,8 @@ impl<K, V> InnerMap<K, V> {
                 }
 
                 // Wrap around to the beginning of the array if necessary.
-                index = index.wrapping_add(1) & mask;
+                index = index.wrapping_add(1) & self.mask;
             }
-        }
-    }
-
-    pub fn reserve(&mut self, additional: usize) {
-        let new_size = self.len() + additional;
-        if new_size > self.capacity() {
-            self.double_capacity()
         }
     }
 }
@@ -420,12 +460,32 @@ impl<K, V> InnerMap<K, V>
 where
     K: Hash + Eq,
 {
-    pub fn get_index<Q>(&self, key: &Q) -> Option<usize>
+    pub fn get_index<Q>(&self, hash: HashValue, key: &Q) -> Option<usize>
     where
         K: Borrow<Q>,
-        Q: Eq + ?Sized,
+        Q: Hash + Eq + ?Sized,
     {
-        None
+        let bucket = self.buckets.get(self.search(hash, key)).unwrap();
+
+        if bucket.is_empty() {
+            None
+        } else {
+            Some(bucket.index)
+        }
+    }
+
+    pub fn get_entry<Q>(&self, hash: HashValue, key: &Q) -> Option<(&K, &V)>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let bucket = self.buckets.get(self.search(hash, key)).unwrap();
+
+        if bucket.is_empty() {
+            None
+        } else {
+            Some(self.entries.get(bucket.index).unwrap().entry())
+        }
     }
 
     /// Returns an index to a bucket where an entry has been found or can be
@@ -435,62 +495,142 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let mask = self.capacity().wrapping_sub(1);
-        let mut index = hash.index(mask);
+        let mut index = hash.index(self.mask);
 
         loop {
             let bucket = self.buckets.get(index).unwrap();
 
             if bucket.is_empty() {
                 return index;
-            } else if bucket.is_tombstone() {
-                // Skip over tombstones.
-                continue;
             } else if bucket.hash == hash {
                 // The hash matches. Make sure the key actually matches.
-                match self.entries.get(bucket.index).unwrap() {
-                    BucketEntry::Entry(k, _) => {
-                        if k.borrow() == key {
-                            return index;
-                        }
-                    }
-                    _ => unreachable!(), // This should be impossible.
+                let (k, _) = self.entries.get(bucket.index).unwrap().entry();
+                if k.borrow() == key {
+                    return index;
                 }
             }
 
             // Wrap around to the beginning of the array if necessary.
-            index = index.wrapping_add(1) & mask;
+            index = index.wrapping_add(1) & self.mask;
         }
     }
 
-    pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    pub fn remove<Q>(&mut self, hash: HashValue, key: &Q) -> Option<(K, V)>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        None
+        // Find the bucket we want to remove.
+        let i = self.search(hash, key);
+
+        // Remove the bucket, leaving an empty bucket in its place.
+        let removed =
+            mem::replace(self.buckets.get_mut(i).unwrap(), Bucket::EMPTY);
+
+        if removed.is_empty() {
+            // Already deleted.
+            None
+        } else {
+            // Found the entry. Replace it with a tombstone and update the last
+            // tombstone while we're at it.
+            let entry = mem::replace(
+                self.entries.get_mut(removed.index).unwrap(),
+                BucketEntry::Tombstone(mem::replace(
+                    &mut self.last_tombstone,
+                    Tombstone::new(removed.index),
+                )),
+            ).into_entry();
+
+            self.tombstones += 1;
+
+            // We found an entry. We need to keep probing to find the last
+            // bucket in this cluster and swap it into the deleted slot. Care
+            // must be taken to only swap a bucket if it belongs in the same
+            // cluster (i.e., it's hash value index is <= `i`).
+            let mut j = i.wrapping_add(1) & self.mask;
+            loop {
+                let stop = {
+                    let bucket = self.buckets.get(j).unwrap();
+                    bucket.is_empty() || bucket.hash.index(self.mask) > i
+                };
+
+                if stop {
+                    let previous = j.wrapping_sub(1) & self.mask;
+                    self.buckets.swap(i, previous);
+                    break;
+                }
+
+                j = j.wrapping_add(1) & self.mask;
+            }
+
+            Some(entry)
+        }
     }
 
-    pub fn insert_index(&mut self, hash: HashValue, key: K, value: V) -> (usize, Option<V>) {
-        let mask = self.capacity().wrapping_sub(1);
-        let index = hash.index(mask);
+    /// Invariant: Space has already been reserved.
+    pub fn insert_full(
+        &mut self,
+        hash: HashValue,
+        key: K,
+        value: V,
+    ) -> (usize, Option<V>) {
+        let i = self.search(hash, &key);
+        let bucket = self.buckets.get_mut(i).unwrap();
 
-        (0, None)
-    }
+        let entry = BucketEntry::Entry(key, value);
 
-    pub fn remove_index(&mut self, index: usize) -> (K, V) {
-        unimplemented!()
+        if bucket.is_empty() {
+            // Doesn't exist yet, we can go ahead and insert into this slot.
+            let index = if self.last_tombstone.is_head() {
+                // No tombstone to reuse. Just insert at the end.
+                let index = self.entries.len();
+                self.entries.push(entry);
+                index
+            } else {
+                // Reuse a tombstone.
+                let last_tombstone = Tombstone::new(self.last_tombstone.0);
+
+                let tombstone = mem::replace(
+                    &mut self.last_tombstone,
+                    last_tombstone,
+                );
+
+                *self.entries.get_mut(tombstone.0).unwrap() = entry;
+
+                self.tombstones -= 1;
+
+                tombstone.0
+            };
+
+            *bucket = Bucket::new(hash, index);
+
+            (index, None)
+        } else {
+            // Already exists. Update it with the new value.
+            let index = bucket.index;
+
+            let previous = mem::replace(
+                self.entries.get_mut(index).unwrap(),
+                entry,
+            ).into_entry();
+
+            (index, Some(previous.1))
+        }
     }
 
     pub fn iter(&self) -> Iter<K, V> {
         Iter {
             iter: self.entries.iter(),
+            tombstones: self.tombstones,
         }
     }
 }
 
 pub struct Iter<'a, K: 'a, V: 'a> {
     iter: slice::Iter<'a, BucketEntry<K, V>>,
+
+    // Number of tombstones in the entries.
+    tombstones: usize,
 }
 
 impl<'a, K, V> Iterator for Iter<'a, K, V> {
@@ -499,12 +639,61 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(entry) = self.iter.next() {
             match entry {
-                BucketEntry::Entry(k, v) => return Some((&k, &v)),
-                BucketEntry::Tombstone(_) => {}
+                BucketEntry::Entry(k, v) => return Some((k, v)),
+                BucketEntry::Tombstone(_) => {
+                    self.tombstones -= 1;
+                }
             }
         }
 
         None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+
+    fn count(self) -> usize {
+        self.len()
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        if self.tombstones == 0 {
+            self.iter.nth(n).map(BucketEntry::entry)
+        } else {
+            let tombstones = &mut self.tombstones;
+            self.iter.by_ref().filter_map(move |entry| {
+                match entry {
+                    BucketEntry::Entry(k, v) => return Some((k, v)),
+                    BucketEntry::Tombstone(_) => {
+                        *tombstones -= 1;
+                        None
+                    }
+                }
+            }).nth(n)
+        }
+    }
+}
+
+impl<'a, K, V> DoubleEndedIterator for Iter<'a, K, V> {
+    fn next_back(&mut self) -> Option<(&'a K, &'a V)> {
+        while let Some(entry) = self.iter.next_back() {
+            match entry {
+                BucketEntry::Entry(k, v) => return Some((k, v)),
+                BucketEntry::Tombstone(_) => {
+                    self.tombstones -= 1;
+                }
+            }
+        }
+
+        None
+    }
+}
+
+impl<'a, K, V> ExactSizeIterator for Iter<'a, K, V> {
+    fn len(&self) -> usize {
+        self.iter.len() - self.tombstones
     }
 }
 
@@ -519,6 +708,8 @@ mod test {
     #[test]
     fn test_create_capacity_zero() {
         let mut m = HashMap::with_capacity(0);
+
+        assert_eq!(m.capacity(), 0);
 
         assert!(m.insert(1, 1).is_none());
 
