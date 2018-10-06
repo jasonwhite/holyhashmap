@@ -43,7 +43,10 @@ impl HashValue {
     /// Returns the index into which this hash value should go given an array
     /// length.
     pub fn index(&self, mask: usize) -> usize {
-        debug_assert!(mask.wrapping_add(1).is_power_of_two(), format!("invalid mask {:x?}", mask));
+        debug_assert!(
+            mask.wrapping_add(1).is_power_of_two(),
+            format!("invalid mask {:x?}", mask)
+        );
         (self.0 & mask as u64) as usize
     }
 }
@@ -113,6 +116,15 @@ where
 
     pub fn reserve(&mut self, additional: usize) {
         self.inner.reserve(additional);
+    }
+
+    pub fn shrink_to_fit(&mut self) {
+        let new_capacity = self.len();
+        if new_capacity == 0 {
+            self.inner = InnerMap::with_capacity(0);
+        } else {
+            self.inner.resize(new_capacity);
+        }
     }
 
     #[inline]
@@ -189,6 +201,16 @@ where
     #[inline]
     pub fn iter(&self) -> Iter<K, V> {
         self.inner.iter()
+    }
+}
+
+impl<K, V, S> Default for HolyHashMap<K, V, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher + Default,
+{
+    fn default() -> Self {
+        Self::with_hasher(Default::default())
     }
 }
 
@@ -336,12 +358,12 @@ impl<K, V> BucketEntry<K, V> {
 struct InnerMap<K, V> {
     // The value to `&` with in order to derive the index of a bucket from
     // a hash value. This is always `capacity - 1` and since capacity is always
-    // a power of two, the mask will be something like `0b1111`. It is faster to
-    // use a bitwise AND than modulus to calculate the index.
+    // a power of two, the mask will be something like `0b1111`. It is faster
+    // to use a bitwise AND than modulus to calculate the index.
     //
-    // Note that it's not strictly necessary to store this here as it can always
-    // be derived, but it is very convenient and avoids the need to recalculate
-    // it for every table lookup.
+    // Note that it's not strictly necessary to store this here as it can
+    // always be derived, but it is very convenient and avoids the need to
+    // recalculate it for every table lookup.
     mask: usize,
 
     // The buckets. This is the vector we do linear probing on. When the
@@ -414,22 +436,21 @@ impl<K, V> InnerMap<K, V> {
         let new_size = self.len() + additional;
         if new_size > self.max_load() {
             // Grow in terms of physical capacity, not max load.
-            self.grow(new_size * 2)
+            //
+            // This might be our first allocation. Make sure we're not just
+            // multiplying 0 by 2.
+            self.resize(new_size);
         }
     }
 
-    // Double the capacity of the buckets.
-    //
-    // Invariant: New capacity must be 
-    fn grow(&mut self, capacity: usize) {
-        // This might be our first allocation. Make sure we're not just
-        // multiplying 0 by 2.
-        let new_capacity = max(32, capacity.next_power_of_two());
+    // Resize the map.
+    pub fn resize(&mut self, capacity: usize) {
+        let capacity = max(32, (capacity * 2).next_power_of_two());
 
         let old_buckets =
-            mem::replace(&mut self.buckets, vec![Bucket::EMPTY; new_capacity]);
+            mem::replace(&mut self.buckets, vec![Bucket::EMPTY; capacity]);
 
-        self.mask = new_capacity.wrapping_sub(1);
+        self.mask = capacity.wrapping_sub(1);
 
         // For each old bucket, reinsert it into the new buckets at the right
         // spot.
@@ -438,7 +459,7 @@ impl<K, V> InnerMap<K, V> {
                 continue;
             }
 
-            let mut index = bucket.hash.index(new_capacity);
+            let mut index = bucket.hash.index(self.mask);
 
             // Probe for an empty bucket and place it there.
             loop {
@@ -590,10 +611,8 @@ where
                 // Reuse a tombstone.
                 let last_tombstone = Tombstone::new(self.last_tombstone.0);
 
-                let tombstone = mem::replace(
-                    &mut self.last_tombstone,
-                    last_tombstone,
-                );
+                let tombstone =
+                    mem::replace(&mut self.last_tombstone, last_tombstone);
 
                 *self.entries.get_mut(tombstone.0).unwrap() = entry;
 
@@ -609,10 +628,9 @@ where
             // Already exists. Update it with the new value.
             let index = bucket.index;
 
-            let previous = mem::replace(
-                self.entries.get_mut(index).unwrap(),
-                entry,
-            ).into_entry();
+            let previous =
+                mem::replace(self.entries.get_mut(index).unwrap(), entry)
+                    .into_entry();
 
             (index, Some(previous.1))
         }
@@ -626,6 +644,7 @@ where
     }
 }
 
+#[derive(Clone)]
 pub struct Iter<'a, K: 'a, V: 'a> {
     iter: slice::Iter<'a, BucketEntry<K, V>>,
 
@@ -663,15 +682,15 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
             self.iter.nth(n).map(BucketEntry::entry)
         } else {
             let tombstones = &mut self.tombstones;
-            self.iter.by_ref().filter_map(move |entry| {
-                match entry {
+            self.iter
+                .by_ref()
+                .filter_map(move |entry| match entry {
                     BucketEntry::Entry(k, v) => return Some((k, v)),
                     BucketEntry::Tombstone(_) => {
                         *tombstones -= 1;
                         None
                     }
-                }
-            }).nth(n)
+                }).nth(n)
         }
     }
 }
@@ -700,10 +719,43 @@ impl<'a, K, V> ExactSizeIterator for Iter<'a, K, V> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::cell::RefCell;
 
     // Simplify the type name so that we can use the exact same tests as std's
     // HashMap.
     type HashMap<K, V> = HolyHashMap<K, V>;
+
+    #[test]
+    fn test_zero_capacities() {
+        type HM = HashMap<i32, i32>;
+
+        let m = HM::new();
+        assert_eq!(m.capacity(), 0);
+
+        let m = HM::default();
+        assert_eq!(m.capacity(), 0);
+
+        let m = HM::with_hasher(RandomState::new());
+        assert_eq!(m.capacity(), 0);
+
+        let m = HM::with_capacity(0);
+        assert_eq!(m.capacity(), 0);
+
+        let m = HM::with_capacity_and_hasher(0, RandomState::new());
+        assert_eq!(m.capacity(), 0);
+
+        let mut m = HM::new();
+        m.insert(1, 1);
+        m.insert(2, 2);
+        m.remove(&1);
+        m.remove(&2);
+        m.shrink_to_fit();
+        assert_eq!(m.capacity(), 0);
+
+        let mut m = HM::new();
+        m.reserve(0);
+        assert_eq!(m.capacity(), 0);
+    }
 
     #[test]
     fn test_create_capacity_zero() {
@@ -741,6 +793,162 @@ mod test {
         assert_eq!(*m2.get(&1).unwrap(), 2);
         assert_eq!(*m2.get(&2).unwrap(), 4);
         assert_eq!(m2.len(), 2);
+    }
+
+
+    thread_local! { static DROP_VECTOR: RefCell<Vec<i32>> = RefCell::new(Vec::new()) }
+
+    #[derive(Hash, PartialEq, Eq)]
+    struct Droppable {
+        k: usize,
+    }
+
+    impl Droppable {
+        fn new(k: usize) -> Droppable {
+            DROP_VECTOR.with(|slot| {
+                slot.borrow_mut()[k] += 1;
+            });
+
+            Droppable { k: k }
+        }
+    }
+
+    impl Drop for Droppable {
+        fn drop(&mut self) {
+            DROP_VECTOR.with(|slot| {
+                slot.borrow_mut()[self.k] -= 1;
+            });
+        }
+    }
+
+    impl Clone for Droppable {
+        fn clone(&self) -> Droppable {
+            Droppable::new(self.k)
+        }
+    }
+
+    #[test]
+    fn test_drops() {
+        DROP_VECTOR.with(|slot| {
+            *slot.borrow_mut() = vec![0; 200];
+        });
+
+        {
+            let mut m = HashMap::new();
+
+            DROP_VECTOR.with(|v| {
+                for i in 0..200 {
+                    assert_eq!(v.borrow()[i], 0);
+                }
+            });
+
+            for i in 0..100 {
+                let d1 = Droppable::new(i);
+                let d2 = Droppable::new(i + 100);
+                m.insert(d1, d2);
+            }
+
+            DROP_VECTOR.with(|v| {
+                for i in 0..200 {
+                    assert_eq!(v.borrow()[i], 1);
+                }
+            });
+
+            for i in 0..50 {
+                let k = Droppable::new(i);
+                let v = m.remove(&k);
+
+                assert!(v.is_some());
+
+                DROP_VECTOR.with(|v| {
+                    assert_eq!(v.borrow()[i], 1);
+                    assert_eq!(v.borrow()[i+100], 1);
+                });
+            }
+
+            DROP_VECTOR.with(|v| {
+                for i in 0..50 {
+                    assert_eq!(v.borrow()[i], 0);
+                    assert_eq!(v.borrow()[i+100], 0);
+                }
+
+                for i in 50..100 {
+                    assert_eq!(v.borrow()[i], 1);
+                    assert_eq!(v.borrow()[i+100], 1);
+                }
+            });
+        }
+
+        DROP_VECTOR.with(|v| {
+            for i in 0..200 {
+                assert_eq!(v.borrow()[i], 0);
+            }
+        });
+    }
+
+    #[test]
+    fn test_into_iter_drops() {
+        DROP_VECTOR.with(|v| {
+            *v.borrow_mut() = vec![0; 200];
+        });
+
+        let hm = {
+            let mut hm = HashMap::new();
+
+            DROP_VECTOR.with(|v| {
+                for i in 0..200 {
+                    assert_eq!(v.borrow()[i], 0);
+                }
+            });
+
+            for i in 0..100 {
+                let d1 = Droppable::new(i);
+                let d2 = Droppable::new(i + 100);
+                hm.insert(d1, d2);
+            }
+
+            DROP_VECTOR.with(|v| {
+                for i in 0..200 {
+                    assert_eq!(v.borrow()[i], 1);
+                }
+            });
+
+            hm
+        };
+
+        // By the way, ensure that cloning doesn't screw up the dropping.
+        drop(hm.clone());
+
+        {
+            let mut half = hm.into_iter().take(50);
+
+            DROP_VECTOR.with(|v| {
+                for i in 0..200 {
+                    assert_eq!(v.borrow()[i], 1);
+                }
+            });
+
+            for _ in half.by_ref() {}
+
+            DROP_VECTOR.with(|v| {
+                let nk = (0..100)
+                    .filter(|&i| v.borrow()[i] == 1)
+                    .count();
+
+                let nv = (0..100)
+                    .filter(|&i| v.borrow()[i + 100] == 1)
+                    .count();
+
+                assert_eq!(nk, 50);
+                assert_eq!(nv, 50);
+            });
+        };
+
+        DROP_VECTOR.with(|v| {
+            for i in 0..200 {
+                assert_eq!(v.borrow()[i], 0);
+            }
+        });
     }
 
     #[test]
