@@ -1047,6 +1047,85 @@ mod test {
         assert_eq!(m.remove(&0), None);
     }
 
+    //#[test]
+    //fn test_empty_iter() {
+    //    let mut m: HashMap<i32, bool> = HashMap::new();
+    //    assert_eq!(m.drain().next(), None);
+    //    assert_eq!(m.keys().next(), None);
+    //    assert_eq!(m.values().next(), None);
+    //    assert_eq!(m.values_mut().next(), None);
+    //    assert_eq!(m.iter().next(), None);
+    //    assert_eq!(m.iter_mut().next(), None);
+    //    assert_eq!(m.len(), 0);
+    //    assert!(m.is_empty());
+    //    assert_eq!(m.into_iter().next(), None);
+    //}
+
+    #[test]
+    fn test_lots_of_insertions() {
+        let mut m = HashMap::new();
+
+        // Try this a few times to make sure we never screw up the hashmap's
+        // internal state.
+        for _ in 0..10 {
+            assert!(m.is_empty());
+
+            for i in 1..1001 {
+                assert!(m.insert(i, i).is_none());
+
+                for j in 1..i + 1 {
+                    let r = m.get(&j);
+                    assert_eq!(r, Some(&j));
+                }
+
+                for j in i + 1..1001 {
+                    let r = m.get(&j);
+                    assert_eq!(r, None);
+                }
+            }
+
+            assert_eq!(m.len(), 1000);
+
+            for i in 1001..2001 {
+                assert!(!m.contains_key(&i));
+            }
+
+            // remove forwards
+            for i in 1..1001 {
+                assert!(m.remove(&i).is_some());
+
+                for j in 1..i + 1 {
+                    assert!(!m.contains_key(&j));
+                }
+
+                for j in i + 1..1001 {
+                    assert!(m.contains_key(&j), format!("Key should exist: {}", j));
+                }
+            }
+
+            for i in 1..1001 {
+                assert!(!m.contains_key(&i));
+            }
+
+            for i in 1..1001 {
+                assert!(m.insert(i, i).is_none());
+            }
+
+            // remove backwards
+            for i in (1..1001).rev() {
+                assert!(m.remove(&i).is_some());
+
+                for j in i..1001 {
+                    assert!(!m.contains_key(&j));
+                }
+
+                for j in 1..i {
+                    assert!(m.contains_key(&j));
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_iterate() {
         let mut m = HashMap::with_capacity(4);
