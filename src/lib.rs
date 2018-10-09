@@ -135,7 +135,7 @@ where
     {
         if self.is_empty() {
             // Can't compute hash for empty map.
-            return None
+            return None;
         }
 
         let hash = HashValue::new(&self.hash_builder, &key);
@@ -159,7 +159,7 @@ where
     {
         if self.is_empty() {
             // Can't compute hash for empty map.
-            return None
+            return None;
         }
 
         let hash = HashValue::new(&self.hash_builder, &key);
@@ -196,7 +196,7 @@ where
     {
         if self.is_empty() {
             // Can't compute hash for empty map.
-            return None
+            return None;
         }
 
         let hash = HashValue::new(&self.hash_builder, &key);
@@ -333,10 +333,15 @@ impl Bucket {
     pub fn is_empty(&self) -> bool {
         self.index == BUCKET_EMPTY
     }
+
+    #[inline]
+    pub fn index(&self, mask: usize) -> usize {
+        self.hash.index(mask)
+    }
 }
 
 /// A tombstone.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
 struct Tombstone(usize);
 
 impl Tombstone {
@@ -371,6 +376,21 @@ impl<K, V> BucketEntry<K, V> {
         match self {
             BucketEntry::Entry(k, v) => (k, v),
             _ => unreachable!(),
+        }
+    }
+
+    pub fn tombstone(&self) -> &Tombstone {
+        match self {
+            BucketEntry::Tombstone(t) => t,
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_tombstone(&self) -> bool {
+        match self {
+            BucketEntry::Tombstone(_) => true,
+            BucketEntry::Entry(_, _) => false,
         }
     }
 }
@@ -480,7 +500,7 @@ impl<K, V> InnerMap<K, V> {
                 continue;
             }
 
-            let mut index = bucket.hash.index(self.mask);
+            let mut index = bucket.index(self.mask);
 
             // Probe for an empty bucket and place it there.
             loop {
@@ -546,7 +566,7 @@ where
                 return index;
             } else if bucket.hash == hash {
                 // The hash matches. Make sure the key actually matches.
-                let (k, _) = self.entries.get(bucket.index).unwrap().entry();
+                let (k, _) = self.entries[bucket.index].entry();
                 if k.borrow() == key {
                     return index;
                 }
@@ -563,11 +583,11 @@ where
         Q: Hash + Eq + ?Sized,
     {
         // Find the bucket we want to remove.
-        let i = self.search(hash, key);
+        let index = self.search(hash, key);
 
         // Remove the bucket, leaving an empty bucket in its place.
         let removed =
-            mem::replace(self.buckets.get_mut(i).unwrap(), Bucket::EMPTY);
+            mem::replace(self.buckets.get_mut(index).unwrap(), Bucket::EMPTY);
 
         if removed.is_empty() {
             // Already deleted.
@@ -589,17 +609,19 @@ where
             // bucket in this cluster and swap it into the deleted slot. Care
             // must be taken to only swap a bucket if it belongs in the same
             // cluster (i.e., it's hash value index is <= `i`).
+            let mut i = index;
             let mut j = i.wrapping_add(1) & self.mask;
             loop {
-                let stop = {
-                    let bucket = self.buckets.get(j).unwrap();
-                    bucket.is_empty() || bucket.hash.index(self.mask) > i
-                };
-
-                if stop {
-                    let previous = j.wrapping_sub(1) & self.mask;
-                    self.buckets.swap(i, previous);
+                if self.buckets[j].is_empty() {
+                    // Found an empty bucket. We're done.
                     break;
+                } else if self.buckets[j].index(self.mask) <= i {
+                    // Found a bucket that belongs in the same "group".
+                    self.buckets.swap(i, j);
+
+                    // The bucket at `i` is now empty. Continue the deletion
+                    // process from here.
+                    i = j;
                 }
 
                 j = j.wrapping_add(1) & self.mask;
@@ -630,10 +652,11 @@ where
                 index
             } else {
                 // Reuse a tombstone.
-                let last_tombstone = Tombstone::new(self.last_tombstone.0);
+                let previous_tombstone =
+                    *self.entries[self.last_tombstone.0].tombstone();
 
                 let tombstone =
-                    mem::replace(&mut self.last_tombstone, last_tombstone);
+                    mem::replace(&mut self.last_tombstone, previous_tombstone);
 
                 *self.entries.get_mut(tombstone.0).unwrap() = entry;
 
@@ -1048,7 +1071,7 @@ mod test {
     }
 
     //#[test]
-    //fn test_empty_iter() {
+    // fn test_empty_iter() {
     //    let mut m: HashMap<i32, bool> = HashMap::new();
     //    assert_eq!(m.drain().next(), None);
     //    assert_eq!(m.keys().next(), None);
@@ -1059,7 +1082,7 @@ mod test {
     //    assert_eq!(m.len(), 0);
     //    assert!(m.is_empty());
     //    assert_eq!(m.into_iter().next(), None);
-    //}
+    // }
 
     #[test]
     fn test_lots_of_insertions() {
@@ -1099,7 +1122,10 @@ mod test {
                 }
 
                 for j in i + 1..1001 {
-                    assert!(m.contains_key(&j), format!("Key should exist: {}", j));
+                    assert!(
+                        m.contains_key(&j),
+                        format!("Key should exist: {}", j)
+                    );
                 }
             }
 
