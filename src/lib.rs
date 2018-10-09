@@ -21,7 +21,7 @@ use std::borrow::Borrow;
 use std::cmp::max;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::iter::FromIterator;
+use std::iter::{FromIterator, FusedIterator};
 use std::mem;
 use std::ops::Index;
 use std::slice;
@@ -49,6 +49,12 @@ impl HashValue {
         );
         (self.0 & mask as u64) as usize
     }
+}
+
+// Helper function for getting the second element in a tuple without generating
+// a lambda function.
+fn first<K, V>(kv: (K, V)) -> K {
+    kv.0
 }
 
 // Helper function for getting the second element in a tuple without generating
@@ -207,6 +213,26 @@ where
     pub fn iter(&self) -> Iter<K, V> {
         self.inner.iter()
     }
+
+    #[inline]
+    pub fn iter_mut(&mut self) -> IterMut<K, V> {
+        self.inner.iter_mut()
+    }
+
+    #[inline]
+    pub fn keys(&self) -> Keys<K, V> {
+        self.inner.keys()
+    }
+
+    #[inline]
+    pub fn values(&self) -> Values<K, V> {
+        self.inner.values()
+    }
+
+    #[inline]
+    pub fn values_mut(&mut self) -> ValuesMut<K, V> {
+        self.inner.values_mut()
+    }
 }
 
 impl<K, V, S> Default for HolyHashMap<K, V, S>
@@ -262,7 +288,7 @@ impl<'a, K, V, S> Extend<(&'a K, &'a V)> for HolyHashMap<K, V, S>
 where
     K: Eq + Hash + Copy,
     V: Copy,
-    S: BuildHasher
+    S: BuildHasher,
 {
     fn extend<I>(&mut self, iter: I)
     where
@@ -387,6 +413,13 @@ impl<K, V> BucketEntry<K, V> {
     }
 
     pub fn entry(&self) -> (&K, &V) {
+        match self {
+            BucketEntry::Entry(k, v) => (k, v),
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn entry_mut(&mut self) -> (&K, &mut V) {
         match self {
             BucketEntry::Entry(k, v) => (k, v),
             _ => unreachable!(),
@@ -692,6 +725,27 @@ where
             tombstones: self.tombstones,
         }
     }
+
+    pub fn iter_mut(&mut self) -> IterMut<K, V> {
+        IterMut {
+            iter: self.entries.iter_mut(),
+            tombstones: self.tombstones,
+        }
+    }
+
+    pub fn keys(&self) -> Keys<K, V> {
+        Keys { iter: self.iter() }
+    }
+
+    pub fn values(&self) -> Values<K, V> {
+        Values { iter: self.iter() }
+    }
+
+    pub fn values_mut(&mut self) -> ValuesMut<K, V> {
+        ValuesMut {
+            iter: self.iter_mut(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -766,6 +820,8 @@ impl<'a, K, V> ExactSizeIterator for Iter<'a, K, V> {
     }
 }
 
+impl<'a, K, V> FusedIterator for Iter<'a, K, V> {}
+
 #[derive(Clone)]
 pub struct IntoIter<K, V> {
     iter: ::std::vec::IntoIter<BucketEntry<K, V>>,
@@ -837,6 +893,218 @@ impl<K, V> ExactSizeIterator for IntoIter<K, V> {
         self.iter.len() - self.tombstones
     }
 }
+
+impl<K, V> FusedIterator for IntoIter<K, V> {}
+
+pub struct IterMut<'a, K: 'a, V: 'a> {
+    iter: slice::IterMut<'a, BucketEntry<K, V>>,
+
+    // Number of tombstones in the entries.
+    tombstones: usize,
+}
+
+impl<'a, K, V> Iterator for IterMut<'a, K, V> {
+    type Item = (&'a K, &'a mut V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(entry) = self.iter.next() {
+            match entry {
+                BucketEntry::Entry(k, v) => return Some((k, v)),
+                BucketEntry::Tombstone(_) => {
+                    self.tombstones -= 1;
+                }
+            }
+        }
+
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+
+    fn count(self) -> usize {
+        self.len()
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        if self.tombstones == 0 {
+            self.iter.nth(n).map(BucketEntry::entry_mut)
+        } else {
+            let tombstones = &mut self.tombstones;
+            self.iter
+                .by_ref()
+                .filter_map(move |entry| match entry {
+                    BucketEntry::Entry(ref k, ref mut v) => return Some((k, v)),
+                    BucketEntry::Tombstone(_) => {
+                        *tombstones -= 1;
+                        None
+                    }
+                }).nth(n)
+        }
+    }
+}
+
+impl<'a, K, V> DoubleEndedIterator for IterMut<'a, K, V> {
+    fn next_back(&mut self) -> Option<(&'a K, &'a mut V)> {
+        while let Some(entry) = self.iter.next_back() {
+            match entry {
+                BucketEntry::Entry(k, v) => return Some((k, v)),
+                BucketEntry::Tombstone(_) => {
+                    self.tombstones -= 1;
+                }
+            }
+        }
+
+        None
+    }
+}
+
+impl<'a, K, V> ExactSizeIterator for IterMut<'a, K, V> {
+    fn len(&self) -> usize {
+        self.iter.len() - self.tombstones
+    }
+}
+
+impl<'a, K, V> FusedIterator for IterMut<'a, K, V> {}
+
+#[derive(Clone)]
+pub struct Keys<'a, K: 'a, V: 'a> {
+    iter: Iter<'a, K, V>,
+}
+
+impl<'a, K, V> Iterator for Keys<'a, K, V> {
+    type Item = &'a K;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next().map(first)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+
+    #[inline]
+    fn count(self) -> usize {
+        self.len()
+    }
+
+    #[inline]
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.iter.nth(n).map(first)
+    }
+}
+
+impl<'a, K, V> DoubleEndedIterator for Keys<'a, K, V> {
+    #[inline]
+    fn next_back(&mut self) -> Option<&'a K> {
+        self.iter.next_back().map(first)
+    }
+}
+
+impl<'a, K, V> ExactSizeIterator for Keys<'a, K, V> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.iter.len()
+    }
+}
+
+impl<'a, K, V> FusedIterator for Keys<'a, K, V> {}
+
+#[derive(Clone)]
+pub struct Values<'a, K: 'a, V: 'a> {
+    iter: Iter<'a, K, V>,
+}
+
+impl<'a, K, V> Iterator for Values<'a, K, V> {
+    type Item = &'a V;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next().map(second)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+
+    #[inline]
+    fn count(self) -> usize {
+        self.len()
+    }
+
+    #[inline]
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.iter.nth(n).map(second)
+    }
+}
+
+impl<'a, K, V> DoubleEndedIterator for Values<'a, K, V> {
+    #[inline]
+    fn next_back(&mut self) -> Option<&'a V> {
+        self.iter.next_back().map(second)
+    }
+}
+
+impl<'a, K, V> ExactSizeIterator for Values<'a, K, V> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.iter.len()
+    }
+}
+
+impl<'a, K, V> FusedIterator for Values<'a, K, V> {}
+
+pub struct ValuesMut<'a, K: 'a, V: 'a> {
+    iter: IterMut<'a, K, V>,
+}
+
+impl<'a, K, V> Iterator for ValuesMut<'a, K, V> {
+    type Item = &'a mut V;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next().map(second)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+
+    #[inline]
+    fn count(self) -> usize {
+        self.len()
+    }
+
+    #[inline]
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.iter.nth(n).map(second)
+    }
+}
+
+impl<'a, K, V> DoubleEndedIterator for ValuesMut<'a, K, V> {
+    #[inline]
+    fn next_back(&mut self) -> Option<&'a mut V> {
+        self.iter.next_back().map(second)
+    }
+}
+
+impl<'a, K, V> ExactSizeIterator for ValuesMut<'a, K, V> {
+    #[inline]
+    fn len(&self) -> usize {
+        self.iter.len()
+    }
+}
+
+impl<'a, K, V> FusedIterator for ValuesMut<'a, K, V> {}
 
 #[cfg(test)]
 mod test {
@@ -1076,19 +1344,19 @@ mod test {
         assert_eq!(m.remove(&0), None);
     }
 
-    //#[test]
-    // fn test_empty_iter() {
-    //    let mut m: HashMap<i32, bool> = HashMap::new();
-    //    assert_eq!(m.drain().next(), None);
-    //    assert_eq!(m.keys().next(), None);
-    //    assert_eq!(m.values().next(), None);
-    //    assert_eq!(m.values_mut().next(), None);
-    //    assert_eq!(m.iter().next(), None);
-    //    assert_eq!(m.iter_mut().next(), None);
-    //    assert_eq!(m.len(), 0);
-    //    assert!(m.is_empty());
-    //    assert_eq!(m.into_iter().next(), None);
-    // }
+    #[test]
+    fn test_empty_iter() {
+        let mut m: HashMap<i32, bool> = HashMap::new();
+        // assert_eq!(m.drain().next(), None);
+        assert_eq!(m.keys().next(), None);
+        assert_eq!(m.values().next(), None);
+        assert_eq!(m.values_mut().next(), None);
+        assert_eq!(m.iter().next(), None);
+        assert_eq!(m.iter_mut().next(), None);
+        assert_eq!(m.len(), 0);
+        assert!(m.is_empty());
+        assert_eq!(m.into_iter().next(), None);
+    }
 
     #[test]
     fn test_lots_of_insertions() {
@@ -1285,26 +1553,6 @@ mod test {
         // Insert at capacity should cause allocation.
         a.insert(item, 0);
         assert!(a.capacity() > a.len());
-    }
-
-    #[test]
-    fn test_adaptive() {
-        const TEST_LEN: usize = 5000;
-        // by cloning we get maps with the same hasher seed
-        let mut first = HashMap::new();
-        let mut second = first.clone();
-        first.extend((0..TEST_LEN).map(|i| (i, i)));
-        second.extend((TEST_LEN..TEST_LEN * 2).map(|i| (i, i)));
-
-        for (&k, &v) in &second {
-            let prev_cap = first.capacity();
-            let expect_grow = first.len() == prev_cap;
-            first.insert(k, v);
-            if !expect_grow && first.capacity() != prev_cap {
-                return;
-            }
-        }
-        panic!("Adaptive early resize failed");
     }
 
     #[test]
