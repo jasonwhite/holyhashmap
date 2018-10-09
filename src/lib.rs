@@ -258,6 +258,20 @@ where
     }
 }
 
+impl<'a, K, V, S> Extend<(&'a K, &'a V)> for HolyHashMap<K, V, S>
+where
+    K: Eq + Hash + Copy,
+    V: Copy,
+    S: BuildHasher
+{
+    fn extend<I>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = (&'a K, &'a V)>,
+    {
+        self.extend(iter.into_iter().map(|(&key, &value)| (key, value)))
+    }
+}
+
 impl<'a, K, Q, V, S> Index<&'a Q> for HolyHashMap<K, V, S>
 where
     K: Eq + Hash + Borrow<Q>,
@@ -383,14 +397,6 @@ impl<K, V> BucketEntry<K, V> {
         match self {
             BucketEntry::Tombstone(t) => t,
             _ => unreachable!(),
-        }
-    }
-
-    #[cfg(test)]
-    pub fn is_tombstone(&self) -> bool {
-        match self {
-            BucketEntry::Tombstone(_) => true,
-            BucketEntry::Entry(_, _) => false,
         }
     }
 }
@@ -1238,6 +1244,67 @@ mod test {
         map.insert(3, 4);
 
         map[&4];
+    }
+
+    #[test]
+    fn test_extend_ref() {
+        let mut a = HashMap::new();
+        a.insert(1, "one");
+        let mut b = HashMap::new();
+        b.insert(2, "two");
+        b.insert(3, "three");
+
+        a.extend(&b);
+
+        assert_eq!(a.len(), 3);
+        assert_eq!(a[&1], "one");
+        assert_eq!(a[&2], "two");
+        assert_eq!(a[&3], "three");
+    }
+
+    #[test]
+    fn test_capacity_not_less_than_len() {
+        let mut a = HashMap::new();
+        let mut item = 0;
+
+        for _ in 0..116 {
+            a.insert(item, 0);
+            item += 1;
+        }
+
+        assert!(a.capacity() > a.len());
+
+        let free = a.capacity() - a.len();
+        for _ in 0..free {
+            a.insert(item, 0);
+            item += 1;
+        }
+
+        assert_eq!(a.len(), a.capacity());
+
+        // Insert at capacity should cause allocation.
+        a.insert(item, 0);
+        assert!(a.capacity() > a.len());
+    }
+
+    #[test]
+    fn test_adaptive() {
+        const TEST_LEN: usize = 5000;
+        // by cloning we get maps with the same hasher seed
+        let mut first = HashMap::new();
+        let mut second = first.clone();
+        first.extend((0..TEST_LEN).map(|i| (i, i)));
+        second.extend((TEST_LEN..TEST_LEN * 2).map(|i| (i, i)));
+
+        for (&k, &v) in &second {
+            let prev_cap = first.capacity();
+            let expect_grow = first.len() == prev_cap;
+            first.insert(k, v);
+            if !expect_grow && first.capacity() != prev_cap {
+                return;
+            }
+        }
+        panic!("Adaptive early resize failed");
     }
 
     #[test]
