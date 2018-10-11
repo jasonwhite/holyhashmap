@@ -20,6 +20,7 @@
 use std::borrow::Borrow;
 use std::cmp::max;
 use std::collections::hash_map::RandomState;
+use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::iter::{FromIterator, FusedIterator};
 use std::mem;
@@ -122,6 +123,9 @@ where
 
     pub fn reserve(&mut self, additional: usize) {
         self.inner.reserve(additional);
+
+        #[cfg(test)]
+        self.check_consistency();
     }
 
     pub fn shrink_to_fit(&mut self) {
@@ -131,6 +135,9 @@ where
         } else {
             self.inner.resize(new_capacity);
         }
+
+        #[cfg(test)]
+        self.check_consistency();
     }
 
     #[inline]
@@ -183,7 +190,12 @@ where
         self.reserve(1);
 
         let hash = HashValue::new(&self.hash_builder, &key);
-        self.inner.insert_full(hash, key, value)
+        let result = self.inner.insert_full(hash, key, value);
+
+        #[cfg(test)]
+        self.check_consistency();
+
+        result
     }
 
     #[inline]
@@ -206,7 +218,12 @@ where
         }
 
         let hash = HashValue::new(&self.hash_builder, &key);
-        self.inner.remove(hash, key)
+        let result = self.inner.remove(hash, key);
+
+        #[cfg(test)]
+        self.check_consistency();
+
+        result
     }
 
     #[inline]
@@ -233,6 +250,34 @@ where
     pub fn values_mut(&mut self) -> ValuesMut<K, V> {
         self.inner.values_mut()
     }
+
+    #[cfg(test)]
+    fn check_consistency(&self) {
+        let capacity = self.inner.capacity();
+        assert!(capacity == 0 || capacity.is_power_of_two());
+
+        // There must be no index that points to a tombstone entry.
+        for bucket in &self.inner.buckets {
+            if !bucket.is_empty() {
+                assert!(match self.inner.entries[bucket.index] {
+                    BucketEntry::Tombstone(_) => false,
+                    _ => true,
+                });
+            }
+        }
+
+        // Check that the keys we have inserted actually exist in the buckets.
+        for (i, entry) in self.inner.entries.iter().enumerate() {
+            match entry {
+                BucketEntry::Tombstone(_) => {},
+                BucketEntry::Entry(k, _) => {
+                    // Check that the key exists and points to this index.
+                    assert_eq!(self.get_index(k), Some(i));
+                }
+            }
+        }
+    }
+
 }
 
 impl<K, V, S> Default for HolyHashMap<K, V, S>
@@ -338,6 +383,40 @@ where
             iter: self.inner.entries.into_iter(),
             tombstones: self.inner.tombstones,
         }
+    }
+}
+
+impl<K, V, S> PartialEq for HolyHashMap<K, V, S>
+where
+    K: Eq + Hash,
+    V: PartialEq,
+    S: BuildHasher,
+{
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+
+        self.iter()
+            .all(|(key, value)| other.get(key).map_or(false, |v| *value == *v))
+    }
+}
+
+impl<K, V, S> Eq for HolyHashMap<K, V, S>
+where
+    K: Eq + Hash,
+    V: Eq,
+    S: BuildHasher,
+{}
+
+impl<K, V, S> fmt::Debug for HolyHashMap<K, V, S>
+where
+    K: Eq + Hash + fmt::Debug,
+    V: fmt::Debug,
+    S: BuildHasher,
+{
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
     }
 }
 
@@ -596,23 +675,23 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let mut index = hash.index(self.mask);
+        let mut i = hash.index(self.mask);
 
         loop {
-            let bucket = self.buckets.get(index).unwrap();
+            let bucket = self.buckets.get(i).unwrap();
 
             if bucket.is_empty() {
-                return index;
+                return i;
             } else if bucket.hash == hash {
                 // The hash matches. Make sure the key actually matches.
                 let (k, _) = self.entries[bucket.index].entry();
                 if k.borrow() == key {
-                    return index;
+                    return i;
                 }
             }
 
             // Wrap around to the beginning of the array if necessary.
-            index = index.wrapping_add(1) & self.mask;
+            i = i.wrapping_add(1) & self.mask;
         }
     }
 
@@ -650,15 +729,19 @@ where
             // cluster (i.e., it's hash value index is <= `i`).
             let mut i = index;
             let mut j = i.wrapping_add(1) & self.mask;
-            loop {
-                if self.buckets[j].is_empty() {
-                    // Found an empty bucket. We're done.
-                    break;
-                } else if self.buckets[j].index(self.mask) <= i {
-                    // Found a bucket that belongs in the same "group".
+            while !self.buckets[j].is_empty() {
+                let k = self.buckets[j].index(self.mask);
+
+                let invalid_position = if j > i {
+                    k <= i || k > j
+                } else {
+                    k <= i && k > j
+                };
+
+                if invalid_position {
                     self.buckets.swap(i, j);
 
-                    // The bucket at `i` is now empty. Continue the deletion
+                    // The bucket at `j` is now empty. Continue the deletion
                     // process from here.
                     i = j;
                 }
@@ -1396,10 +1479,7 @@ mod test {
                 }
 
                 for j in i + 1..1001 {
-                    assert!(
-                        m.contains_key(&j),
-                        format!("Key should exist: {}", j)
-                    );
+                    assert!(m.contains_key(&j));
                 }
             }
 
