@@ -1395,13 +1395,14 @@ impl<'a, K, V> FusedIterator for ValuesMut<'a, K, V> {}
 
 #[cfg(test)]
 mod test {
+    // Simplify the type name so that we can use the exact same tests as std's
+    // HashMap.
     use super::Entry::{Occupied, Vacant};
     use super::HolyHashMap as HashMap;
     use super::RandomState;
     use std::cell::RefCell;
 
-    // Simplify the type name so that we can use the exact same tests as std's
-    // HashMap.
+    extern crate rand;
 
     #[test]
     fn test_zero_capacities() {
@@ -1633,6 +1634,17 @@ mod test {
     }
 
     #[test]
+    fn test_empty_entry() {
+        let mut m: HashMap<i32, bool> = HashMap::new();
+        match m.entry(0) {
+            Occupied(_) => panic!(),
+            Vacant(_) => {}
+        }
+        assert!(*m.entry(0).or_insert(true));
+        assert_eq!(m.len(), 1);
+    }
+
+    #[test]
     fn test_empty_iter() {
         let mut m: HashMap<i32, bool> = HashMap::new();
         // assert_eq!(m.drain().next(), None);
@@ -1800,6 +1812,94 @@ mod test {
     }
 
     #[test]
+    fn test_entry() {
+        let xs = [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)];
+
+        let mut map: HashMap<_, _> = xs.iter().cloned().collect();
+
+        // Existing key (insert)
+        match map.entry(1) {
+            Vacant(_) => unreachable!(),
+            Occupied(mut view) => {
+                assert_eq!(view.get(), &10);
+                assert_eq!(view.insert(100), 10);
+            }
+        }
+        assert_eq!(map.get(&1).unwrap(), &100);
+        assert_eq!(map.len(), 6);
+
+        // Existing key (update)
+        match map.entry(2) {
+            Vacant(_) => unreachable!(),
+            Occupied(mut view) => {
+                let v = view.get_mut();
+                let new_v = (*v) * 10;
+                *v = new_v;
+            }
+        }
+        assert_eq!(map.get(&2).unwrap(), &200);
+        assert_eq!(map.len(), 6);
+
+        // Existing key (take)
+        match map.entry(3) {
+            Vacant(_) => unreachable!(),
+            Occupied(view) => {
+                assert_eq!(view.remove(), 30);
+            }
+        }
+        assert_eq!(map.get(&3), None);
+        assert_eq!(map.len(), 5);
+
+        // Inexistent key (insert)
+        match map.entry(10) {
+            Occupied(_) => unreachable!(),
+            Vacant(view) => {
+                assert_eq!(*view.insert(1000), 1000);
+            }
+        }
+        assert_eq!(map.get(&10).unwrap(), &1000);
+        assert_eq!(map.len(), 6);
+    }
+
+    #[cfg(lolwut)]
+    #[test]
+    fn test_entry_take_doesnt_corrupt() {
+        #![allow(deprecated)] // rand
+                              // Test for #19292
+        fn check(m: &HashMap<i32, ()>) {
+            for k in m.keys() {
+                assert!(
+                    m.contains_key(k),
+                    "{} is in keys() but not in the map?",
+                    k
+                );
+            }
+        }
+
+        let mut m = HashMap::new();
+        let mut rng = rand::thread_rng();
+
+        // Populate the map with some items.
+        for _ in 0..50 {
+            let x = rng.gen_range(-10, 10);
+            m.insert(x, ());
+        }
+
+        for i in 0..1000 {
+            let x = rng.gen_range(-10, 10);
+            match m.entry(x) {
+                Vacant(_) => {}
+                Occupied(e) => {
+                    println!("{}: remove {}", i, x);
+                    e.remove();
+                }
+            }
+
+            check(&m);
+        }
+    }
+
+    #[test]
     fn test_extend_ref() {
         let mut a = HashMap::new();
         a.insert(1, "one");
@@ -1874,32 +1974,5 @@ mod test {
         }
         assert_eq!(a.len(), 1);
         assert_eq!(a[key], value);
-    }
-
-    #[test]
-    fn insert() {
-        let mut m = HashMap::new();
-        assert_eq!(m.len(), 0);
-        assert!(m.insert(1, 2).is_none());
-        assert_eq!(m.len(), 1);
-        assert!(m.insert(2, 4).is_none());
-        assert_eq!(m.len(), 2);
-        assert_eq!(m.insert(2, 5), Some(4));
-        assert_eq!(m.len(), 2);
-    }
-
-    #[test]
-    fn remove() {
-        let mut m = HashMap::new();
-        assert!(m.insert(1, 2).is_none());
-        assert!(m.insert(2, 4).is_none());
-        assert_eq!(m.len(), 2);
-        assert_eq!(m.remove(&2), Some(4));
-        assert_eq!(m.len(), 1);
-        assert_eq!(m.remove(&2), None);
-        assert_eq!(m.len(), 1);
-        assert!(m.insert(2, 4).is_none());
-        assert_eq!(m.len(), 2);
-        assert_eq!(m.remove_entry(&2), Some((2, 4)));
     }
 }
