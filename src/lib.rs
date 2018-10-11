@@ -292,6 +292,14 @@ where
         self.inner.values_mut()
     }
 
+    #[inline]
+    pub fn entry(&mut self, key: K) -> Entry<K, V> {
+        self.reserve(1);
+
+        let hash = HashValue::new(&self.hash_builder, &key);
+        self.inner.entry(hash, key)
+    }
+
     #[cfg(test)]
     fn check_consistency(&self) {
         let capacity = self.inner.capacity();
@@ -310,7 +318,7 @@ where
         // Check that the keys we have inserted actually exist in the buckets.
         for (i, entry) in self.inner.entries.iter().enumerate() {
             match entry {
-                BucketEntry::Tombstone(_) => {},
+                BucketEntry::Tombstone(_) => {}
                 BucketEntry::Entry(k, _) => {
                     // Check that the key exists and points to this index.
                     assert_eq!(self.get_index(k), Some(EntryIndex(i)));
@@ -318,7 +326,6 @@ where
             }
         }
     }
-
 }
 
 impl<K, V, S> Default for HolyHashMap<K, V, S>
@@ -663,6 +670,54 @@ impl<K, V> InnerMap<K, V> {
     fn set_raw_entry(&mut self, index: EntryIndex, entry: BucketEntry<K, V>) {
         *self.entries.get_mut(index.0).unwrap() = entry;
     }
+
+    // Removes an existing bucket.
+    //
+    // Precondition: The bucket is not empty.
+    pub fn remove_bucket(&mut self, index: usize) -> (K, V) {
+        // Remove the bucket, leaving an empty bucket in its place.
+        let removed =
+            mem::replace(self.buckets.get_mut(index).unwrap(), Bucket::EMPTY);
+
+        // Found the entry. Replace it with a tombstone and update the last
+        // tombstone while we're at it.
+        let tombstone = BucketEntry::Tombstone(mem::replace(
+            &mut self.last_tombstone,
+            Tombstone::new(removed.index),
+        ));
+        let entry = mem::replace(self.raw_entry_mut(removed.index), tombstone)
+            .into_entry();
+
+        self.tombstones += 1;
+
+        // We found an entry. We need to keep probing to find the last
+        // bucket in this cluster and swap it into the deleted slot. Care
+        // must be taken to only swap a bucket if it belongs in the same
+        // cluster (i.e., it's hash value index is <= `i`).
+        let mut i = index;
+        let mut j = i.wrapping_add(1) & self.mask;
+        while !self.buckets[j].is_empty() {
+            let k = self.buckets[j].index(self.mask);
+
+            let invalid_position = if j > i {
+                k <= i || k > j
+            } else {
+                k <= i && k > j
+            };
+
+            if invalid_position {
+                self.buckets.swap(i, j);
+
+                // The bucket at `j` is now empty. Continue the deletion
+                // process from here.
+                i = j;
+            }
+
+            j = j.wrapping_add(1) & self.mask;
+        }
+
+        entry
+    }
 }
 
 impl<K, V> InnerMap<K, V>
@@ -729,58 +784,12 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        // Find the bucket we want to remove.
         let index = self.search(hash, key);
 
-        // Remove the bucket, leaving an empty bucket in its place.
-        let removed =
-            mem::replace(self.buckets.get_mut(index).unwrap(), Bucket::EMPTY);
-
-        if removed.is_empty() {
-            // Already deleted.
+        if self.buckets[index].is_empty() {
             None
         } else {
-            // Found the entry. Replace it with a tombstone and update the last
-            // tombstone while we're at it.
-            let tombstone = 
-                BucketEntry::Tombstone(mem::replace(
-                    &mut self.last_tombstone,
-                    Tombstone::new(removed.index),
-                ));
-            let entry = mem::replace(
-                self.raw_entry_mut(removed.index),
-                tombstone,
-            ).into_entry();
-
-            self.tombstones += 1;
-
-            // We found an entry. We need to keep probing to find the last
-            // bucket in this cluster and swap it into the deleted slot. Care
-            // must be taken to only swap a bucket if it belongs in the same
-            // cluster (i.e., it's hash value index is <= `i`).
-            let mut i = index;
-            let mut j = i.wrapping_add(1) & self.mask;
-            while !self.buckets[j].is_empty() {
-                let k = self.buckets[j].index(self.mask);
-
-                let invalid_position = if j > i {
-                    k <= i || k > j
-                } else {
-                    k <= i && k > j
-                };
-
-                if invalid_position {
-                    self.buckets.swap(i, j);
-
-                    // The bucket at `j` is now empty. Continue the deletion
-                    // process from here.
-                    i = j;
-                }
-
-                j = j.wrapping_add(1) & self.mask;
-            }
-
-            Some(entry)
+            Some(self.remove_bucket(index))
         }
     }
 
@@ -793,44 +802,54 @@ where
     ) -> (EntryIndex, Option<V>) {
         let i = self.search(hash, &key);
 
-        let entry = BucketEntry::Entry(key, value);
-
         if self.buckets[i].is_empty() {
-            // Doesn't exist yet, we can go ahead and insert into this slot.
-            let index = if self.last_tombstone.is_end() {
-                // No tombstone to reuse. Just insert at the end.
-                let index = self.entries.len();
-                self.entries.push(entry);
-                EntryIndex(index)
-            } else {
-                // Reuse a tombstone.
-                let last_tombstone = {
-                    *self.raw_entry(self.last_tombstone.0).tombstone()
-                };
-
-                let tombstone =
-                    mem::replace(&mut self.last_tombstone, last_tombstone);
-
-                self.set_raw_entry(tombstone.0, entry);
-
-                self.tombstones -= 1;
-
-                tombstone.0
-            };
-
-            self.buckets[i] = Bucket::new(hash, index);
-
-            (index, None)
+            (self.insert_new(i, hash, key, value), None)
         } else {
+            let entry = BucketEntry::Entry(key, value);
+
             // Already exists. Update it with the new value.
             let index = self.buckets[i].index;
 
             let previous =
-                mem::replace(self.raw_entry_mut(index), entry)
-                    .into_entry();
+                mem::replace(self.raw_entry_mut(index), entry).into_entry();
 
             (index, Some(previous.1))
         }
+    }
+
+    pub fn insert_new(
+        &mut self,
+        bucket: usize,
+        hash: HashValue,
+        key: K,
+        value: V,
+    ) -> EntryIndex {
+        let entry = BucketEntry::Entry(key, value);
+
+        // Doesn't exist yet, we can go ahead and insert into this slot.
+        let index = if self.last_tombstone.is_end() {
+            // No tombstone to reuse. Just insert at the end.
+            let index = self.entries.len();
+            self.entries.push(entry);
+            EntryIndex(index)
+        } else {
+            // Reuse a tombstone.
+            let last_tombstone =
+                { *self.raw_entry(self.last_tombstone.0).tombstone() };
+
+            let tombstone =
+                mem::replace(&mut self.last_tombstone, last_tombstone);
+
+            self.set_raw_entry(tombstone.0, entry);
+
+            self.tombstones -= 1;
+
+            tombstone.0
+        };
+
+        self.buckets[bucket] = Bucket::new(hash, index);
+
+        index
     }
 
     pub fn iter(&self) -> Iter<K, V> {
@@ -860,6 +879,21 @@ where
             iter: self.iter_mut(),
         }
     }
+
+    pub fn entry(&mut self, hash: HashValue, key: K) -> Entry<K, V> {
+        let index = self.search(hash, &key);
+
+        if self.buckets[index].is_empty() {
+            Entry::Vacant(VacantEntry {
+                map: self,
+                index,
+                hash,
+                key,
+            })
+        } else {
+            Entry::Occupied(OccupiedEntry { map: self, index })
+        }
+    }
 }
 
 pub enum Entry<'a, K: 'a, V: 'a> {
@@ -872,21 +906,27 @@ pub struct OccupiedEntry<'a, K: 'a, V: 'a> {
 
     // The position of the bucket where this entry lives. (Not the position in
     // the list of entries.)
-    index: EntryIndex,
+    index: usize,
 }
 
 pub struct VacantEntry<'a, K: 'a, V: 'a> {
     map: &'a mut InnerMap<K, V>,
 
     // The position of the bucket where we can insert this entry.
-    index: EntryIndex,
+    index: usize,
+
+    // The hash of the key to insert.
+    hash: HashValue,
 
     // The key to insert.
     key: K,
 }
 
 impl<'a, K, V> Entry<'a, K, V> {
-    pub fn or_insert(self, default: V) -> &'a mut V {
+    pub fn or_insert(self, default: V) -> &'a mut V
+    where
+        K: Eq + Hash,
+    {
         match self {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => entry.insert(default),
@@ -895,6 +935,7 @@ impl<'a, K, V> Entry<'a, K, V> {
 
     pub fn or_insert_with<F>(self, default: F) -> &'a mut V
     where
+        K: Eq + Hash,
         F: FnOnce() -> V,
     {
         match self {
@@ -918,13 +959,14 @@ impl<'a, K, V> Entry<'a, K, V> {
             Entry::Occupied(mut entry) => {
                 f(entry.get_mut());
                 Entry::Occupied(entry)
-            },
+            }
             vacant => vacant,
         }
     }
 
     pub fn or_default(self) -> &'a mut V
     where
+        K: Eq + Hash,
         V: Default,
     {
         match self {
@@ -935,32 +977,38 @@ impl<'a, K, V> Entry<'a, K, V> {
 }
 
 impl<'a, K, V> OccupiedEntry<'a, K, V> {
+    pub fn index(&self) -> EntryIndex {
+        self.map.buckets[self.index].index
+    }
+
     pub fn key(&self) -> &K {
-        &self.map.raw_entry(self.index).entry().0
+        &self.map.raw_entry(self.index()).entry().0
     }
 
     pub fn remove_entry(self) -> (K, V) {
-        unimplemented!()
+        self.map.remove_bucket(self.index)
     }
 
     pub fn get(&self) -> &V {
-        unimplemented!()
+        &self.map.raw_entry(self.index()).entry().1
     }
 
     pub fn get_mut(&mut self) -> &mut V {
-        unimplemented!()
+        let entry_index = self.index();
+        self.map.raw_entry_mut(entry_index).entry_mut().1
     }
 
     pub fn into_mut(self) -> &'a mut V {
-        unimplemented!()
+        let entry_index = self.index();
+        self.map.raw_entry_mut(entry_index).entry_mut().1
     }
 
     pub fn insert(&mut self, value: V) -> V {
-        unimplemented!()
+        mem::replace(self.get_mut(), value)
     }
 
     pub fn remove(self) -> V {
-        unimplemented!()
+        self.map.remove_bucket(self.index).1
     }
 }
 
@@ -974,11 +1022,16 @@ impl<'a, K, V> VacantEntry<'a, K, V> {
     }
 
     pub fn index(&self) -> EntryIndex {
-        self.index
+        self.map.buckets[self.index].index
     }
 
-    pub fn insert(self, _value: V) -> &'a mut V {
-        unimplemented!()
+    pub fn insert(self, value: V) -> &'a mut V
+    where
+        K: Hash + Eq,
+    {
+        let entry_index =
+            self.map.insert_new(self.index, self.hash, self.key, value);
+        self.map.raw_entry_mut(entry_index).entry_mut().1
     }
 }
 
@@ -1342,12 +1395,13 @@ impl<'a, K, V> FusedIterator for ValuesMut<'a, K, V> {}
 
 #[cfg(test)]
 mod test {
-    use super::*;
+    use super::Entry::{Occupied, Vacant};
+    use super::HolyHashMap as HashMap;
+    use super::RandomState;
     use std::cell::RefCell;
 
     // Simplify the type name so that we can use the exact same tests as std's
     // HashMap.
-    type HashMap<K, V> = HolyHashMap<K, V>;
 
     #[test]
     fn test_zero_capacities() {
@@ -1784,6 +1838,42 @@ mod test {
         // Insert at capacity should cause allocation.
         a.insert(item, 0);
         assert!(a.capacity() > a.len());
+    }
+
+    #[test]
+    fn test_occupied_entry_key() {
+        let mut a = HashMap::new();
+        let key = "hello there";
+        let value = "value goes here";
+        assert!(a.is_empty());
+        a.insert(key.clone(), value.clone());
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[key], value);
+
+        match a.entry(key.clone()) {
+            Vacant(_) => panic!(),
+            Occupied(e) => assert_eq!(key, *e.key()),
+        }
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[key], value);
+    }
+
+    #[test]
+    fn test_vacant_entry_key() {
+        let mut a = HashMap::new();
+        let key = "hello there";
+        let value = "value goes here";
+
+        assert!(a.is_empty());
+        match a.entry(key.clone()) {
+            Occupied(_) => panic!(),
+            Vacant(e) => {
+                assert_eq!(key, *e.key());
+                e.insert(value.clone());
+            }
+        }
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[key], value);
     }
 
     #[test]
