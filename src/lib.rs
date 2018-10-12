@@ -27,7 +27,7 @@ use std::mem;
 use std::ops::Index;
 use std::slice;
 
-#[cfg(feature = "serde_impl")]
+#[cfg(feature = "serde")]
 pub mod serde;
 
 /// > Holy hash maps, Batman!
@@ -154,6 +154,8 @@ where
         &self.hash_builder
     }
 
+    /// Maxium size before the map needs to reallocate. This is not the true
+    /// capacity, but rather the max load of the map.
     pub fn capacity(&self) -> usize {
         // Capacity when the max load factor is taken into account.
         self.inner.max_load()
@@ -178,8 +180,8 @@ where
         self.check_consistency();
     }
 
-    #[inline]
-    pub fn get_index<Q>(&self, key: &Q) -> Option<EntryIndex>
+    /// Gets the entry index of the key.
+    pub fn key_index<Q>(&self, key: &Q) -> Option<EntryIndex>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -191,6 +193,27 @@ where
 
         let hash = HashValue::new(&self.hash_builder, &key);
         self.inner.get_index(hash, key)
+    }
+
+    /// Gets the entry by index.
+    ///
+    /// Returns `None` if the index is invalid (i.e., it is out of bounds or
+    /// points to a deleted entry).
+    #[inline]
+    pub fn index_entry(&self, index: EntryIndex) -> Option<(&K, &V)> {
+        self.inner.index_entry(index)
+    }
+
+    /// Gets the mutable entry by index.
+    ///
+    /// Returns `None` if the index is invalid (i.e., it is out of bounds or
+    /// points to a deleted entry).
+    #[inline]
+    pub fn index_entry_mut(
+        &mut self,
+        index: EntryIndex,
+    ) -> Option<(&K, &mut V)> {
+        self.inner.index_entry_mut(index)
     }
 
     #[inline]
@@ -209,7 +232,7 @@ where
         Q: Hash + Eq + ?Sized,
     {
         if self.is_empty() {
-            // Can't compute hash for empty map.
+            // Can't compute hash index for empty map.
             return None;
         }
 
@@ -297,6 +320,7 @@ where
         self.inner.entry(hash, key)
     }
 
+    // Checks the internal consistency of the map. Helpful for finding bugs.
     #[cfg(test)]
     fn check_consistency(&self) {
         let capacity = self.inner.capacity();
@@ -318,7 +342,7 @@ where
                 None => {}
                 Some((k, _)) => {
                     // Check that the key exists and points to this index.
-                    assert_eq!(self.get_index(k), Some(EntryIndex(i)));
+                    assert_eq!(self.key_index(k), Some(EntryIndex(i)));
                 }
             }
         }
@@ -594,8 +618,19 @@ impl<K, V> InnerMap<K, V> {
         }
     }
 
-    fn raw_entry(&self, index: EntryIndex) -> &Option<(K, V)> {
-        self.entries.get(index.0).unwrap()
+    pub fn index_entry(&self, index: EntryIndex) -> Option<(&K, &V)> {
+        self.entries
+            .get(index.0)
+            .and_then(|e| e.as_ref().map(|(k, v)| (k, v)))
+    }
+
+    pub fn index_entry_mut(
+        &mut self,
+        index: EntryIndex,
+    ) -> Option<(&K, &mut V)> {
+        self.entries
+            .get_mut(index.0)
+            .and_then(|e| e.as_mut().map(|(k, v)| (&*k, v)))
     }
 
     fn raw_entry_mut(&mut self, index: EntryIndex) -> &mut Option<(K, V)> {
@@ -676,12 +711,7 @@ where
         if bucket.is_empty() {
             None
         } else {
-            Some(
-                self.raw_entry(bucket.index)
-                    .as_ref()
-                    .map(|(k, v)| (k, v))
-                    .unwrap(),
-            )
+            Some(self.index_entry(bucket.index).unwrap())
         }
     }
 
@@ -701,7 +731,7 @@ where
                 return i;
             } else if bucket.hash == hash {
                 // The hash matches. Make sure the key actually matches.
-                let (k, _) = self.raw_entry(bucket.index).as_ref().unwrap();
+                let (k, _) = self.index_entry(bucket.index).unwrap();
                 if k.borrow() == key {
                     return i;
                 }
@@ -907,7 +937,7 @@ impl<'a, K, V> OccupiedEntry<'a, K, V> {
     }
 
     pub fn key(&self) -> &K {
-        &self.map.raw_entry(self.index()).as_ref().unwrap().0
+        self.map.index_entry(self.index()).unwrap().0
     }
 
     pub fn remove_entry(self) -> (K, V) {
@@ -915,17 +945,17 @@ impl<'a, K, V> OccupiedEntry<'a, K, V> {
     }
 
     pub fn get(&self) -> &V {
-        &self.map.raw_entry(self.index()).as_ref().unwrap().1
+        self.map.index_entry(self.index()).unwrap().1
     }
 
     pub fn get_mut(&mut self) -> &mut V {
         let entry_index = self.index();
-        &mut self.map.raw_entry_mut(entry_index).as_mut().unwrap().1
+        self.map.index_entry_mut(entry_index).unwrap().1
     }
 
     pub fn into_mut(self) -> &'a mut V {
         let entry_index = self.index();
-        &mut self.map.raw_entry_mut(entry_index).as_mut().unwrap().1
+        self.map.index_entry_mut(entry_index).unwrap().1
     }
 
     pub fn insert(&mut self, value: V) -> V {
@@ -956,7 +986,7 @@ impl<'a, K, V> VacantEntry<'a, K, V> {
     {
         let entry_index =
             self.map.insert_new(self.index, self.hash, self.key, value);
-        &mut self.map.raw_entry_mut(entry_index).as_mut().unwrap().1
+        self.map.index_entry_mut(entry_index).unwrap().1
     }
 }
 

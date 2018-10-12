@@ -115,15 +115,18 @@ mod test {
         map.insert(2, 4);
         map.insert(3, 9);
 
-        assert_tokens(&map, &[
-            Token::Map { len: Some(3) },
-            Token::I32(1),
-            Token::I32(1),
-            Token::I32(2),
-            Token::I32(4),
-            Token::I32(3),
-            Token::I32(9),
-            Token::MapEnd,
-        ]);
+        assert_tokens(
+            &map,
+            &[
+                Token::Map { len: Some(3) },
+                Token::I32(1),
+                Token::I32(1),
+                Token::I32(2),
+                Token::I32(4),
+                Token::I32(3),
+                Token::I32(9),
+                Token::MapEnd,
+            ],
+        );
     }
 }
