@@ -27,6 +27,9 @@ use std::mem;
 use std::ops::Index;
 use std::slice;
 
+#[cfg(feature = "serde_impl")]
+pub mod serde;
+
 /// > Holy hash maps, Batman!
 /// > -- <cite>Robin</cite>
 #[derive(Clone)]
@@ -1058,11 +1061,13 @@ impl<K, V> Iterator for IntoIter<K, V> {
         None
     }
 
+    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         let len = self.len();
         (len, Some(len))
     }
 
+    #[inline]
     fn count(self) -> usize {
         self.len()
     }
