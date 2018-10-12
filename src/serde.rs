@@ -24,10 +24,10 @@ use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 
-use self::serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
+use self::serde::de::{self, Deserialize, Deserializer, MapAccess, Visitor};
 use self::serde::ser::{Serialize, SerializeMap, Serializer};
 
-use HolyHashMap;
+use {HolyHashMap, EntryIndex};
 
 impl<K, V, S> Serialize for HolyHashMap<K, V, S>
 where
@@ -90,6 +90,42 @@ where
         D: Deserializer<'de>,
     {
         deserializer.deserialize_map(MapVisitor(PhantomData))
+    }
+}
+
+impl Serialize for EntryIndex
+{
+    fn serialize<T>(&self, serializer: T) -> Result<T::Ok, T::Error>
+    where
+        T: Serializer,
+    {
+        serializer.serialize_u64(self.0 as u64)
+    }
+}
+
+struct IndexVisitor;
+
+impl<'de> Visitor<'de> for IndexVisitor {
+    type Value = EntryIndex;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "an entry index")
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(EntryIndex(v as usize))
+    }
+}
+
+impl<'de> Deserialize<'de> for EntryIndex {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_u64(IndexVisitor)
     }
 }
 

@@ -70,7 +70,7 @@ struct InnerMap<K, V> {
 /// A type-safe position in the entries vector. This type is intentionally
 /// lacking trait implementions such as `PartialOrd` or `Add` in order to avoid
 /// creating an invalid index.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct EntryIndex(usize);
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
