@@ -58,16 +58,10 @@ struct InnerMap<K, V> {
     // The actual data. Key-value pairs are pushed onto the end of the vector.
     // The entires are guaranteed to not change position in the vector upon
     // insertion or deletion.
-    entries: Vec<BucketEntry<K, V>>,
+    entries: Vec<Option<(K, V)>>,
 
-    // The number of tombstones in the table (i.e., the number of `Tombstone`
-    // values in `entries`). This is used to give an accurate length of the
-    // table.
-    tombstones: usize,
-
-    // Index of the last tombstone. This is used to reclaim deleted entries
-    // such that indices are not invalidated upon removals.
-    last_tombstone: Tombstone,
+    // Indices of tombstones in the entries.
+    tombstones: Vec<EntryIndex>,
 }
 
 /// A type-safe position in the entries vector. This type is intentionally
@@ -309,8 +303,8 @@ where
         for bucket in &self.inner.buckets {
             if !bucket.is_empty() {
                 assert!(match self.inner.entries[bucket.index.0] {
-                    BucketEntry::Tombstone(_) => false,
-                    _ => true,
+                    None => false,
+                    Some(_) => true,
                 });
             }
         }
@@ -318,8 +312,8 @@ where
         // Check that the keys we have inserted actually exist in the buckets.
         for (i, entry) in self.inner.entries.iter().enumerate() {
             match entry {
-                BucketEntry::Tombstone(_) => {}
-                BucketEntry::Entry(k, _) => {
+                None => {}
+                Some((k, _)) => {
                     // Check that the key exists and points to this index.
                     assert_eq!(self.get_index(k), Some(EntryIndex(i)));
                 }
@@ -429,7 +423,7 @@ where
     fn into_iter(self) -> IntoIter<K, V> {
         IntoIter {
             iter: self.inner.entries.into_iter(),
-            tombstones: self.inner.tombstones,
+            tombstones: self.inner.tombstones.len(),
         }
     }
 }
@@ -512,66 +506,6 @@ impl Bucket {
     }
 }
 
-/// A tombstone.
-///
-/// Tombstones point to the previous tombstone entry.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-struct Tombstone(EntryIndex);
-
-impl Tombstone {
-    /// The end of the linked list.
-    const END: Tombstone = Tombstone(EntryIndex(usize::max_value()));
-
-    /// Creates a new tombstone.
-    pub fn new(prev: EntryIndex) -> Self {
-        Tombstone(prev)
-    }
-
-    /// Returns `true` if this tombstone doesn't point to the previous
-    /// tombstone (i.e., it is the end of the linked list).
-    pub fn is_end(&self) -> bool {
-        self == &Self::END
-    }
-}
-
-/// A bucket entry. `None` if the entry has been deleted (i.e., it is
-/// a tombstone).
-#[derive(Debug, Clone)]
-enum BucketEntry<K, V> {
-    Tombstone(Tombstone),
-    Entry(K, V),
-}
-
-impl<K, V> BucketEntry<K, V> {
-    pub fn into_entry(self) -> (K, V) {
-        match self {
-            BucketEntry::Entry(k, v) => (k, v),
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn entry(&self) -> (&K, &V) {
-        match self {
-            BucketEntry::Entry(k, v) => (k, v),
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn entry_mut(&mut self) -> (&K, &mut V) {
-        match self {
-            BucketEntry::Entry(k, v) => (k, v),
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn tombstone(&self) -> &Tombstone {
-        match self {
-            BucketEntry::Tombstone(t) => t,
-            _ => unreachable!(),
-        }
-    }
-}
-
 impl<K, V> InnerMap<K, V> {
     pub fn with_capacity(capacity: usize) -> Self {
         if capacity == 0 {
@@ -580,8 +514,7 @@ impl<K, V> InnerMap<K, V> {
                 mask: 0,
                 buckets: Vec::new(),
                 entries: Vec::new(),
-                tombstones: 0,
-                last_tombstone: Tombstone::END,
+                tombstones: Vec::new(),
             }
         } else {
             // Always use a power-of-two capacity so that we can use `&` instead
@@ -595,14 +528,13 @@ impl<K, V> InnerMap<K, V> {
                 mask: n.wrapping_sub(1),
                 buckets: vec![Bucket::EMPTY; n],
                 entries: Vec::new(),
-                tombstones: 0,
-                last_tombstone: Tombstone::END,
+                tombstones: Vec::new(),
             }
         }
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len() - self.tombstones
+        self.entries.len() - self.tombstones.len()
     }
 
     pub fn capacity(&self) -> usize {
@@ -659,15 +591,15 @@ impl<K, V> InnerMap<K, V> {
         }
     }
 
-    fn raw_entry(&self, index: EntryIndex) -> &BucketEntry<K, V> {
+    fn raw_entry(&self, index: EntryIndex) -> &Option<(K, V)> {
         self.entries.get(index.0).unwrap()
     }
 
-    fn raw_entry_mut(&mut self, index: EntryIndex) -> &mut BucketEntry<K, V> {
+    fn raw_entry_mut(&mut self, index: EntryIndex) -> &mut Option<(K, V)> {
         self.entries.get_mut(index.0).unwrap()
     }
 
-    fn set_raw_entry(&mut self, index: EntryIndex, entry: BucketEntry<K, V>) {
+    fn set_raw_entry(&mut self, index: EntryIndex, entry: Option<(K, V)>) {
         *self.entries.get_mut(index.0).unwrap() = entry;
     }
 
@@ -679,16 +611,9 @@ impl<K, V> InnerMap<K, V> {
         let removed =
             mem::replace(self.buckets.get_mut(index).unwrap(), Bucket::EMPTY);
 
-        // Found the entry. Replace it with a tombstone and update the last
-        // tombstone while we're at it.
-        let tombstone = BucketEntry::Tombstone(mem::replace(
-            &mut self.last_tombstone,
-            Tombstone::new(removed.index),
-        ));
-        let entry = mem::replace(self.raw_entry_mut(removed.index), tombstone)
-            .into_entry();
-
-        self.tombstones += 1;
+        // Found the entry. Remove it and update the tombstone list.
+        let entry = self.raw_entry_mut(removed.index).take().unwrap();
+        self.tombstones.push(removed.index);
 
         // We found an entry. We need to keep probing to find the last
         // bucket in this cluster and swap it into the deleted slot. Care
@@ -748,7 +673,12 @@ where
         if bucket.is_empty() {
             None
         } else {
-            Some(self.raw_entry(bucket.index).entry())
+            Some(
+                self.raw_entry(bucket.index)
+                    .as_ref()
+                    .map(|(k, v)| (k, v))
+                    .unwrap(),
+            )
         }
     }
 
@@ -768,7 +698,7 @@ where
                 return i;
             } else if bucket.hash == hash {
                 // The hash matches. Make sure the key actually matches.
-                let (k, _) = self.raw_entry(bucket.index).entry();
+                let (k, _) = self.raw_entry(bucket.index).as_ref().unwrap();
                 if k.borrow() == key {
                     return i;
                 }
@@ -805,18 +735,20 @@ where
         if self.buckets[i].is_empty() {
             (self.insert_new(i, hash, key, value), None)
         } else {
-            let entry = BucketEntry::Entry(key, value);
+            let entry = Some((key, value));
 
             // Already exists. Update it with the new value.
             let index = self.buckets[i].index;
 
             let previous =
-                mem::replace(self.raw_entry_mut(index), entry).into_entry();
+                mem::replace(self.raw_entry_mut(index), entry).unwrap();
 
             (index, Some(previous.1))
         }
     }
 
+    // Precondition: `bucket` points to an empty bucket where this entry can be
+    // inserted.
     pub fn insert_new(
         &mut self,
         bucket: usize,
@@ -824,27 +756,17 @@ where
         key: K,
         value: V,
     ) -> EntryIndex {
-        let entry = BucketEntry::Entry(key, value);
+        let entry = Some((key, value));
 
-        // Doesn't exist yet, we can go ahead and insert into this slot.
-        let index = if self.last_tombstone.is_end() {
+        let index = if let Some(index) = self.tombstones.pop() {
+            // Reuse a tombstone.
+            self.set_raw_entry(index, entry);
+            index
+        } else {
             // No tombstone to reuse. Just insert at the end.
             let index = self.entries.len();
             self.entries.push(entry);
             EntryIndex(index)
-        } else {
-            // Reuse a tombstone.
-            let last_tombstone =
-                { *self.raw_entry(self.last_tombstone.0).tombstone() };
-
-            let tombstone =
-                mem::replace(&mut self.last_tombstone, last_tombstone);
-
-            self.set_raw_entry(tombstone.0, entry);
-
-            self.tombstones -= 1;
-
-            tombstone.0
         };
 
         self.buckets[bucket] = Bucket::new(hash, index);
@@ -855,14 +777,14 @@ where
     pub fn iter(&self) -> Iter<K, V> {
         Iter {
             iter: self.entries.iter(),
-            tombstones: self.tombstones,
+            tombstones: self.tombstones.len(),
         }
     }
 
     pub fn iter_mut(&mut self) -> IterMut<K, V> {
         IterMut {
             iter: self.entries.iter_mut(),
-            tombstones: self.tombstones,
+            tombstones: self.tombstones.len(),
         }
     }
 
@@ -982,7 +904,7 @@ impl<'a, K, V> OccupiedEntry<'a, K, V> {
     }
 
     pub fn key(&self) -> &K {
-        &self.map.raw_entry(self.index()).entry().0
+        &self.map.raw_entry(self.index()).as_ref().unwrap().0
     }
 
     pub fn remove_entry(self) -> (K, V) {
@@ -990,17 +912,17 @@ impl<'a, K, V> OccupiedEntry<'a, K, V> {
     }
 
     pub fn get(&self) -> &V {
-        &self.map.raw_entry(self.index()).entry().1
+        &self.map.raw_entry(self.index()).as_ref().unwrap().1
     }
 
     pub fn get_mut(&mut self) -> &mut V {
         let entry_index = self.index();
-        self.map.raw_entry_mut(entry_index).entry_mut().1
+        &mut self.map.raw_entry_mut(entry_index).as_mut().unwrap().1
     }
 
     pub fn into_mut(self) -> &'a mut V {
         let entry_index = self.index();
-        self.map.raw_entry_mut(entry_index).entry_mut().1
+        &mut self.map.raw_entry_mut(entry_index).as_mut().unwrap().1
     }
 
     pub fn insert(&mut self, value: V) -> V {
@@ -1031,13 +953,13 @@ impl<'a, K, V> VacantEntry<'a, K, V> {
     {
         let entry_index =
             self.map.insert_new(self.index, self.hash, self.key, value);
-        self.map.raw_entry_mut(entry_index).entry_mut().1
+        &mut self.map.raw_entry_mut(entry_index).as_mut().unwrap().1
     }
 }
 
 #[derive(Clone)]
 pub struct Iter<'a, K: 'a, V: 'a> {
-    iter: slice::Iter<'a, BucketEntry<K, V>>,
+    iter: slice::Iter<'a, Option<(K, V)>>,
 
     // Number of tombstones in the entries.
     tombstones: usize,
@@ -1049,8 +971,8 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(entry) = self.iter.next() {
             match entry {
-                BucketEntry::Entry(k, v) => return Some((k, v)),
-                BucketEntry::Tombstone(_) => {
+                Some((k, v)) => return Some((k, v)),
+                None => {
                     self.tombstones -= 1;
                 }
             }
@@ -1070,14 +992,17 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
 
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
         if self.tombstones == 0 {
-            self.iter.nth(n).map(BucketEntry::entry)
+            self.iter.nth(n).map(|entry| {
+                let (k, v) = entry.as_ref().unwrap();
+                (k, v)
+            })
         } else {
             let tombstones = &mut self.tombstones;
             self.iter
                 .by_ref()
                 .filter_map(move |entry| match entry {
-                    BucketEntry::Entry(k, v) => return Some((k, v)),
-                    BucketEntry::Tombstone(_) => {
+                    Some((k, v)) => return Some((k, v)),
+                    None => {
                         *tombstones -= 1;
                         None
                     }
@@ -1090,8 +1015,8 @@ impl<'a, K, V> DoubleEndedIterator for Iter<'a, K, V> {
     fn next_back(&mut self) -> Option<(&'a K, &'a V)> {
         while let Some(entry) = self.iter.next_back() {
             match entry {
-                BucketEntry::Entry(k, v) => return Some((k, v)),
-                BucketEntry::Tombstone(_) => {
+                Some((k, v)) => return Some((k, v)),
+                None => {
                     self.tombstones -= 1;
                 }
             }
@@ -1111,7 +1036,7 @@ impl<'a, K, V> FusedIterator for Iter<'a, K, V> {}
 
 #[derive(Clone)]
 pub struct IntoIter<K, V> {
-    iter: ::std::vec::IntoIter<BucketEntry<K, V>>,
+    iter: ::std::vec::IntoIter<Option<(K, V)>>,
 
     // Number of tombstones in the entries.
     tombstones: usize,
@@ -1123,8 +1048,8 @@ impl<K, V> Iterator for IntoIter<K, V> {
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(entry) = self.iter.next() {
             match entry {
-                BucketEntry::Entry(k, v) => return Some((k, v)),
-                BucketEntry::Tombstone(_) => {
+                Some(e) => return Some(e),
+                None => {
                     self.tombstones -= 1;
                 }
             }
@@ -1144,14 +1069,14 @@ impl<K, V> Iterator for IntoIter<K, V> {
 
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
         if self.tombstones == 0 {
-            self.iter.nth(n).map(BucketEntry::into_entry)
+            self.iter.nth(n).map(Option::unwrap)
         } else {
             let tombstones = &mut self.tombstones;
             self.iter
                 .by_ref()
                 .filter_map(move |entry| match entry {
-                    BucketEntry::Entry(k, v) => return Some((k, v)),
-                    BucketEntry::Tombstone(_) => {
+                    Some(e) => return Some(e),
+                    None => {
                         *tombstones -= 1;
                         None
                     }
@@ -1164,8 +1089,8 @@ impl<K, V> DoubleEndedIterator for IntoIter<K, V> {
     fn next_back(&mut self) -> Option<(K, V)> {
         while let Some(entry) = self.iter.next_back() {
             match entry {
-                BucketEntry::Entry(k, v) => return Some((k, v)),
-                BucketEntry::Tombstone(_) => {
+                Some(e) => return Some(e),
+                None => {
                     self.tombstones -= 1;
                 }
             }
@@ -1184,7 +1109,7 @@ impl<K, V> ExactSizeIterator for IntoIter<K, V> {
 impl<K, V> FusedIterator for IntoIter<K, V> {}
 
 pub struct IterMut<'a, K: 'a, V: 'a> {
-    iter: slice::IterMut<'a, BucketEntry<K, V>>,
+    iter: slice::IterMut<'a, Option<(K, V)>>,
 
     // Number of tombstones in the entries.
     tombstones: usize,
@@ -1196,8 +1121,8 @@ impl<'a, K, V> Iterator for IterMut<'a, K, V> {
     fn next(&mut self) -> Option<Self::Item> {
         while let Some(entry) = self.iter.next() {
             match entry {
-                BucketEntry::Entry(k, v) => return Some((k, v)),
-                BucketEntry::Tombstone(_) => {
+                Some((k, v)) => return Some((k, v)),
+                None => {
                     self.tombstones -= 1;
                 }
             }
@@ -1206,25 +1131,30 @@ impl<'a, K, V> Iterator for IterMut<'a, K, V> {
         None
     }
 
+    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         let len = self.len();
         (len, Some(len))
     }
 
+    #[inline]
     fn count(self) -> usize {
         self.len()
     }
 
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
         if self.tombstones == 0 {
-            self.iter.nth(n).map(BucketEntry::entry_mut)
+            self.iter.nth(n).map(|entry| {
+                let (k, v) = entry.as_mut().unwrap();
+                (&*k, v)
+            })
         } else {
             let tombstones = &mut self.tombstones;
             self.iter
                 .by_ref()
                 .filter_map(move |entry| match entry {
-                    BucketEntry::Entry(ref k, ref mut v) => return Some((k, v)),
-                    BucketEntry::Tombstone(_) => {
+                    Some((ref k, ref mut v)) => return Some((k, v)),
+                    None => {
                         *tombstones -= 1;
                         None
                     }
@@ -1237,8 +1167,8 @@ impl<'a, K, V> DoubleEndedIterator for IterMut<'a, K, V> {
     fn next_back(&mut self) -> Option<(&'a K, &'a mut V)> {
         while let Some(entry) = self.iter.next_back() {
             match entry {
-                BucketEntry::Entry(k, v) => return Some((k, v)),
-                BucketEntry::Tombstone(_) => {
+                Some((k, v)) => return Some((k, v)),
+                None => {
                     self.tombstones -= 1;
                 }
             }
