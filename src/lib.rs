@@ -896,6 +896,13 @@ pub struct VacantEntry<'a, K: 'a, V: 'a> {
 }
 
 impl<'a, K, V> Entry<'a, K, V> {
+    pub fn index(&self) -> EntryIndex {
+        match self {
+            Entry::Occupied(entry) => entry.index(),
+            Entry::Vacant(entry) => entry.index(),
+        }
+    }
+
     pub fn or_insert(self, default: V) -> &'a mut V
     where
         K: Eq + Hash,
@@ -986,16 +993,21 @@ impl<'a, K, V> OccupiedEntry<'a, K, V> {
 }
 
 impl<'a, K, V> VacantEntry<'a, K, V> {
+    /// The index at which the next entry will be inserted.
+    pub fn index(&self) -> EntryIndex {
+        self.map
+            .tombstones
+            .last()
+            .cloned()
+            .unwrap_or_else(|| EntryIndex(self.map.entries.len()))
+    }
+
     pub fn key(&self) -> &K {
         &self.key
     }
 
     pub fn into_key(self) -> K {
         self.key
-    }
-
-    pub fn index(&self) -> EntryIndex {
-        self.map.buckets[self.index].index
     }
 
     pub fn insert(self, value: V) -> &'a mut V
@@ -2051,5 +2063,27 @@ mod test {
         m.insert("e", 4);
 
         assert!(m.indices().eq(vec![0, 2, 3].into_iter().map(EntryIndex)));
+    }
+
+    #[test]
+    fn test_entry_index() {
+        let xs = [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)];
+
+        let mut map: HashMap<_, _> = xs.iter().cloned().collect();
+
+        // Occupied entries
+        assert_eq!(map.entry(1).index(), EntryIndex(0));
+        assert_eq!(map.entry(6).index(), EntryIndex(5));
+
+        // Vacant entry (map has no tombstones)
+        assert_eq!(map.entry(7).index(), EntryIndex(6));
+
+        map.remove(&3);
+        map.remove(&5);
+
+        // Vacant entries
+        assert_eq!(map.entry(3).index(), EntryIndex(4));
+        map.insert(5, 50);
+        assert_eq!(map.entry(3).index(), EntryIndex(2));
     }
 }
