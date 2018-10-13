@@ -22,7 +22,7 @@ use std::cmp::max;
 use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::iter::{FromIterator, FusedIterator};
+use std::iter::{Enumerate, FromIterator, FusedIterator};
 use std::mem;
 use std::ops::Index;
 use std::slice;
@@ -305,6 +305,11 @@ where
     #[inline]
     pub fn values(&self) -> Values<K, V> {
         self.inner.values()
+    }
+
+    #[inline]
+    pub fn indices(&self) -> Indices<K, V> {
+        self.inner.indices()
     }
 
     #[inline]
@@ -835,6 +840,13 @@ where
         }
     }
 
+    pub fn indices(&self) -> Indices<K, V> {
+        Indices {
+            iter: self.entries.iter().enumerate(),
+            tombstones: self.tombstones.len(),
+        }
+    }
+
     pub fn entry(&mut self, hash: HashValue, key: K) -> Entry<K, V> {
         let index = self.search(hash, &key);
 
@@ -1358,11 +1370,86 @@ impl<'a, K, V> ExactSizeIterator for ValuesMut<'a, K, V> {
 
 impl<'a, K, V> FusedIterator for ValuesMut<'a, K, V> {}
 
+#[derive(Clone)]
+pub struct Indices<'a, K: 'a, V: 'a> {
+    iter: Enumerate<slice::Iter<'a, Option<(K, V)>>>,
+
+    // Number of tombstones in the entries.
+    tombstones: usize,
+}
+
+impl<'a, K, V> Iterator for Indices<'a, K, V> {
+    type Item = EntryIndex;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((i, entry)) = self.iter.next() {
+            match entry {
+                Some(_) => return Some(EntryIndex(i)),
+                None => {
+                    self.tombstones -= 1;
+                }
+            }
+        }
+
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+
+    fn count(self) -> usize {
+        self.len()
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        if self.tombstones == 0 {
+            Some(EntryIndex(n))
+        } else {
+            let tombstones = &mut self.tombstones;
+            self.iter
+                .by_ref()
+                .filter_map(move |(i, entry)| match entry {
+                    Some(_) => return Some(EntryIndex(i)),
+                    None => {
+                        *tombstones -= 1;
+                        None
+                    }
+                }).nth(n)
+        }
+    }
+}
+
+impl<'a, K, V> DoubleEndedIterator for Indices<'a, K, V> {
+    fn next_back(&mut self) -> Option<EntryIndex> {
+        while let Some((i, entry)) = self.iter.next_back() {
+            match entry {
+                Some(_) => return Some(EntryIndex(i)),
+                None => {
+                    self.tombstones -= 1;
+                }
+            }
+        }
+
+        None
+    }
+}
+
+impl<'a, K, V> ExactSizeIterator for Indices<'a, K, V> {
+    fn len(&self) -> usize {
+        self.iter.len() - self.tombstones
+    }
+}
+
+impl<'a, K, V> FusedIterator for Indices<'a, K, V> {}
+
 #[cfg(test)]
 mod test {
     // Simplify the type name so that we can use the exact same tests as std's
     // HashMap.
     use super::Entry::{Occupied, Vacant};
+    use super::EntryIndex;
     use super::HolyHashMap as HashMap;
     use super::RandomState;
     use std::cell::RefCell;
@@ -1939,5 +2026,24 @@ mod test {
         }
         assert_eq!(a.len(), 1);
         assert_eq!(a[key], value);
+    }
+
+    #[test]
+    fn test_indices() {
+        let mut m: HashMap<_, _> = [("a", 0), ("b", 1), ("c", 2), ("d", 3)]
+            .iter()
+            .cloned()
+            .collect();
+
+        assert!(m.indices().eq(vec![0, 1, 2, 3].into_iter().map(EntryIndex)));
+
+        m.remove("b");
+
+        assert!(m.indices().eq(vec![0, 2, 3].into_iter().map(EntryIndex)));
+
+        m.remove("a");
+        m.insert("e", 4);
+
+        assert!(m.indices().eq(vec![0, 2, 3].into_iter().map(EntryIndex)));
     }
 }

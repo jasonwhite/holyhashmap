@@ -27,7 +27,7 @@ use std::marker::PhantomData;
 use self::serde::de::{self, Deserialize, Deserializer, MapAccess, Visitor};
 use self::serde::ser::{Serialize, SerializeMap, Serializer};
 
-use {HolyHashMap, EntryIndex};
+use {EntryIndex, HolyHashMap};
 
 impl<K, V, S> Serialize for HolyHashMap<K, V, S>
 where
@@ -93,8 +93,7 @@ where
     }
 }
 
-impl Serialize for EntryIndex
-{
+impl Serialize for EntryIndex {
     fn serialize<T>(&self, serializer: T) -> Result<T::Ok, T::Error>
     where
         T: Serializer,
