@@ -187,7 +187,7 @@ where
     }
 
     /// Gets the entry index of the key.
-    pub fn key_index<Q>(&self, key: &Q) -> Option<EntryIndex>
+    pub fn to_index<Q>(&self, key: &Q) -> Option<EntryIndex>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -198,7 +198,7 @@ where
         }
 
         let hash = HashValue::new(&self.hash_builder, &key);
-        self.inner.get_index(hash, key)
+        self.inner.to_index(hash, key)
     }
 
     /// Gets the entry by index.
@@ -206,8 +206,8 @@ where
     /// Returns `None` if the index is invalid (i.e., it is out of bounds or
     /// points to a deleted entry).
     #[inline]
-    pub fn index_entry(&self, index: EntryIndex) -> Option<(&K, &V)> {
-        self.inner.index_entry(index)
+    pub fn from_index(&self, index: EntryIndex) -> Option<(&K, &V)> {
+        self.inner.from_index(index)
     }
 
     /// Gets the mutable entry by index.
@@ -215,11 +215,11 @@ where
     /// Returns `None` if the index is invalid (i.e., it is out of bounds or
     /// points to a deleted entry).
     #[inline]
-    pub fn index_entry_mut(
+    pub fn from_index_mut(
         &mut self,
         index: EntryIndex,
     ) -> Option<(&K, &mut V)> {
-        self.inner.index_entry_mut(index)
+        self.inner.from_index_mut(index)
     }
 
     #[inline]
@@ -353,7 +353,7 @@ where
                 None => {}
                 Some((k, _)) => {
                     // Check that the key exists and points to this index.
-                    assert_eq!(self.key_index(k), Some(EntryIndex(i)));
+                    assert_eq!(self.to_index(k), Some(EntryIndex(i)));
                 }
             }
         }
@@ -629,13 +629,13 @@ impl<K, V> InnerMap<K, V> {
         }
     }
 
-    pub fn index_entry(&self, index: EntryIndex) -> Option<(&K, &V)> {
+    pub fn from_index(&self, index: EntryIndex) -> Option<(&K, &V)> {
         self.entries
             .get(index.0)
             .and_then(|e| e.as_ref().map(|(k, v)| (k, v)))
     }
 
-    pub fn index_entry_mut(
+    pub fn from_index_mut(
         &mut self,
         index: EntryIndex,
     ) -> Option<(&K, &mut V)> {
@@ -698,7 +698,7 @@ impl<K, V> InnerMap<K, V>
 where
     K: Hash + Eq,
 {
-    pub fn get_index<Q>(&self, hash: HashValue, key: &Q) -> Option<EntryIndex>
+    pub fn to_index<Q>(&self, hash: HashValue, key: &Q) -> Option<EntryIndex>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -722,7 +722,7 @@ where
         if bucket.is_empty() {
             None
         } else {
-            Some(self.index_entry(bucket.index).unwrap())
+            Some(self.from_index(bucket.index).unwrap())
         }
     }
 
@@ -742,7 +742,7 @@ where
                 return i;
             } else if bucket.hash == hash {
                 // The hash matches. Make sure the key actually matches.
-                let (k, _) = self.index_entry(bucket.index).unwrap();
+                let (k, _) = self.from_index(bucket.index).unwrap();
                 if k.borrow() == key {
                     return i;
                 }
@@ -962,7 +962,7 @@ impl<'a, K, V> OccupiedEntry<'a, K, V> {
     }
 
     pub fn key(&self) -> &K {
-        self.map.index_entry(self.index()).unwrap().0
+        self.map.from_index(self.index()).unwrap().0
     }
 
     pub fn remove_entry(self) -> (K, V) {
@@ -970,17 +970,17 @@ impl<'a, K, V> OccupiedEntry<'a, K, V> {
     }
 
     pub fn get(&self) -> &V {
-        self.map.index_entry(self.index()).unwrap().1
+        self.map.from_index(self.index()).unwrap().1
     }
 
     pub fn get_mut(&mut self) -> &mut V {
         let entry_index = self.index();
-        self.map.index_entry_mut(entry_index).unwrap().1
+        self.map.from_index_mut(entry_index).unwrap().1
     }
 
     pub fn into_mut(self) -> &'a mut V {
         let entry_index = self.index();
-        self.map.index_entry_mut(entry_index).unwrap().1
+        self.map.from_index_mut(entry_index).unwrap().1
     }
 
     pub fn insert(&mut self, value: V) -> V {
@@ -1016,7 +1016,7 @@ impl<'a, K, V> VacantEntry<'a, K, V> {
     {
         let entry_index =
             self.map.insert_new(self.index, self.hash, self.key, value);
-        self.map.index_entry_mut(entry_index).unwrap().1
+        self.map.from_index_mut(entry_index).unwrap().1
     }
 }
 
