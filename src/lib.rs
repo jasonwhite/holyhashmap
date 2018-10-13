@@ -73,6 +73,12 @@ struct InnerMap<K, V> {
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub struct EntryIndex(usize);
 
+impl fmt::Display for EntryIndex {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 struct HashValue(u64);
 
