@@ -257,13 +257,32 @@ where
         self.insert_full(key, value).1
     }
 
-    #[inline]
     pub fn insert_full(&mut self, key: K, value: V) -> (EntryIndex, Option<V>) {
         // Must reserve additional space before calculating the hash.
         self.reserve(1);
 
         let hash = HashValue::new(&self.hash_builder, &key);
         let result = self.inner.insert_full(hash, key, value);
+
+        #[cfg(test)]
+        self.check_consistency();
+
+        result
+    }
+
+    /// Insert a key-value pair without reusing a tombstone.
+    ///
+    /// Useful for deserialization purposes.
+    #[cfg(feature = "serde")]
+    fn insert_no_tombstone(
+        &mut self,
+        key: K,
+        value: V,
+    ) -> (EntryIndex, Option<V>) {
+        self.reserve(1);
+
+        let hash = HashValue::new(&self.hash_builder, &key);
+        let result = self.inner.insert_no_tombstone(hash, key, value);
 
         #[cfg(test)]
         self.check_consistency();
@@ -773,6 +792,16 @@ where
         }
     }
 
+    /// Inserts a tombstone into the entries vector, leaving an empty slot.
+    /// Useful for retaining index stability upon serialization/deserialization.
+    #[cfg(feature = "serde")]
+    pub fn insert_tombstone(&mut self) -> EntryIndex {
+        let index = EntryIndex(self.entries.len());
+        self.entries.push(None);
+        self.tombstones.push(index);
+        index
+    }
+
     /// Invariant: Space has already been reserved.
     pub fn insert_full(
         &mut self,
@@ -793,6 +822,31 @@ where
             let previous =
                 mem::replace(self.raw_entry_mut(index), entry).unwrap();
 
+            (index, Some(previous.1))
+        }
+    }
+
+    /// Insert an element without reusing a tombstone. Useful for
+    /// deserialization purposes where we must preserve indices.
+    #[cfg(feature = "serde")]
+    pub fn insert_no_tombstone(
+        &mut self,
+        hash: HashValue,
+        key: K,
+        value: V,
+    ) -> (EntryIndex, Option<V>) {
+        let i = self.search(hash, &key);
+        let entry = Some((key, value));
+
+        if self.buckets[i].is_empty() {
+            let index = EntryIndex(self.entries.len());
+            self.entries.push(entry);
+            self.buckets[i] = Bucket::new(hash, index);
+            (index, None)
+        } else {
+            let index = self.buckets[i].index;
+            let previous =
+                mem::replace(self.raw_entry_mut(index), entry).unwrap();
             (index, Some(previous.1))
         }
     }

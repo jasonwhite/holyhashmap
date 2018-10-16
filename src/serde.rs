@@ -24,8 +24,8 @@ use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 
-use self::serde::de::{self, Deserialize, Deserializer, MapAccess, Visitor};
-use self::serde::ser::{Serialize, SerializeMap, Serializer};
+use self::serde::de::{self, Deserialize, Deserializer, SeqAccess, Visitor};
+use self::serde::ser::{Serialize, SerializeSeq, Serializer};
 
 use {EntryIndex, HolyHashMap};
 
@@ -39,9 +39,10 @@ where
     where
         T: Serializer,
     {
-        let mut map = serializer.serialize_map(Some(self.len()))?;
-        for (k, v) in self {
-            map.serialize_entry(k, v)?;
+        let mut map =
+            serializer.serialize_seq(Some(self.inner.entries.len()))?;
+        for entry in &self.inner.entries {
+            map.serialize_element(entry)?;
         }
 
         map.end()
@@ -59,20 +60,29 @@ where
     type Value = HolyHashMap<K, V, S>;
 
     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "a map")
+        write!(f, "a sequence of entries")
     }
 
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    fn visit_seq<A>(self, mut map: A) -> Result<Self::Value, A::Error>
     where
-        A: MapAccess<'de>,
+        A: SeqAccess<'de>,
     {
         let mut values = HolyHashMap::with_capacity_and_hasher(
             map.size_hint().unwrap_or(0),
             S::default(),
         );
 
-        while let Some((key, value)) = map.next_entry()? {
-            values.insert(key, value);
+        while let Some(entry) = map.next_element()? {
+            match entry {
+                Some((k, v)) => {
+                    // Insert key/value without reusing a tombstone.
+                    values.insert_no_tombstone(k, v);
+                }
+                None => {
+                    // Insert key/value without reusing a tombstone.
+                    values.inner.insert_tombstone();
+                }
+            }
         }
 
         Ok(values)
@@ -89,7 +99,7 @@ where
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_map(MapVisitor(PhantomData))
+        deserializer.deserialize_seq(MapVisitor(PhantomData))
     }
 }
 
@@ -140,7 +150,7 @@ mod test {
     fn test_empty() {
         let map = HolyHashMap::<u32, u32>::new();
 
-        assert_tokens(&map, &[Token::Map { len: Some(0) }, Token::MapEnd]);
+        assert_tokens(&map, &[Token::Seq { len: Some(0) }, Token::SeqEnd]);
     }
 
     #[test]
@@ -153,14 +163,23 @@ mod test {
         assert_tokens(
             &map,
             &[
-                Token::Map { len: Some(3) },
+                Token::Seq { len: Some(3) },
+                Token::Some,
+                Token::Tuple { len: 2 },
                 Token::I32(1),
                 Token::I32(1),
+                Token::TupleEnd,
+                Token::Some,
+                Token::Tuple { len: 2 },
                 Token::I32(2),
                 Token::I32(4),
+                Token::TupleEnd,
+                Token::Some,
+                Token::Tuple { len: 2 },
                 Token::I32(3),
                 Token::I32(9),
-                Token::MapEnd,
+                Token::TupleEnd,
+                Token::SeqEnd,
             ],
         );
     }
