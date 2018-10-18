@@ -122,10 +122,69 @@ fn second<K, V>(kv: (K, V)) -> V {
     kv.1
 }
 
-impl<K, V> HolyHashMap<K, V>
-where
-    K: Eq + Hash,
-{
+impl<K, V, S> HolyHashMap<K, V, S> {
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Maxium size before the map needs to reallocate. This is not the true
+    /// capacity, but rather the max load of the map.
+    pub fn capacity(&self) -> usize {
+        // Capacity when the max load factor is taken into account.
+        self.inner.max_load()
+    }
+
+    pub fn reserve(&mut self, additional: usize) {
+        self.inner.reserve(additional);
+    }
+
+    pub fn shrink_to_fit(&mut self) {
+        let new_capacity = self.len();
+        if new_capacity == 0 {
+            self.inner = InnerMap::with_capacity(0);
+        } else {
+            self.inner.resize(new_capacity);
+        }
+    }
+
+    #[inline]
+    pub fn iter(&self) -> Iter<K, V> {
+        self.inner.iter()
+    }
+
+    #[inline]
+    pub fn iter_mut(&mut self) -> IterMut<K, V> {
+        self.inner.iter_mut()
+    }
+
+    #[inline]
+    pub fn keys(&self) -> Keys<K, V> {
+        self.inner.keys()
+    }
+
+    #[inline]
+    pub fn values(&self) -> Values<K, V> {
+        self.inner.values()
+    }
+
+    #[inline]
+    pub fn indices(&self) -> Indices<K, V> {
+        self.inner.indices()
+    }
+
+    #[inline]
+    pub fn values_mut(&mut self) -> ValuesMut<K, V> {
+        self.inner.values_mut()
+    }
+}
+
+impl<K, V> HolyHashMap<K, V> {
     pub fn new() -> Self {
         Self::with_capacity(0)
     }
@@ -137,17 +196,11 @@ where
 
 impl<K, V, S> HolyHashMap<K, V, S>
 where
-    K: Eq + Hash,
     S: BuildHasher,
 {
     #[inline]
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+    pub fn hasher(&self) -> &S {
+        &self.hash_builder
     }
 
     #[inline]
@@ -161,37 +214,13 @@ where
             inner: InnerMap::with_capacity(capacity),
         }
     }
+}
 
-    pub fn hasher(&self) -> &S {
-        &self.hash_builder
-    }
-
-    /// Maxium size before the map needs to reallocate. This is not the true
-    /// capacity, but rather the max load of the map.
-    pub fn capacity(&self) -> usize {
-        // Capacity when the max load factor is taken into account.
-        self.inner.max_load()
-    }
-
-    pub fn reserve(&mut self, additional: usize) {
-        self.inner.reserve(additional);
-
-        #[cfg(test)]
-        self.check_consistency();
-    }
-
-    pub fn shrink_to_fit(&mut self) {
-        let new_capacity = self.len();
-        if new_capacity == 0 {
-            self.inner = InnerMap::with_capacity(0);
-        } else {
-            self.inner.resize(new_capacity);
-        }
-
-        #[cfg(test)]
-        self.check_consistency();
-    }
-
+impl<K, V, S> HolyHashMap<K, V, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+{
     /// Gets the entry index of the key.
     pub fn to_index<Q>(&self, key: &Q) -> Option<EntryIndex>
     where
@@ -319,36 +348,6 @@ where
     }
 
     #[inline]
-    pub fn iter(&self) -> Iter<K, V> {
-        self.inner.iter()
-    }
-
-    #[inline]
-    pub fn iter_mut(&mut self) -> IterMut<K, V> {
-        self.inner.iter_mut()
-    }
-
-    #[inline]
-    pub fn keys(&self) -> Keys<K, V> {
-        self.inner.keys()
-    }
-
-    #[inline]
-    pub fn values(&self) -> Values<K, V> {
-        self.inner.values()
-    }
-
-    #[inline]
-    pub fn indices(&self) -> Indices<K, V> {
-        self.inner.indices()
-    }
-
-    #[inline]
-    pub fn values_mut(&mut self) -> ValuesMut<K, V> {
-        self.inner.values_mut()
-    }
-
-    #[inline]
     pub fn entry(&mut self, key: K) -> Entry<K, V> {
         self.reserve(1);
 
@@ -387,7 +386,6 @@ where
 
 impl<K, V, S> Default for HolyHashMap<K, V, S>
 where
-    K: Eq + Hash,
     S: BuildHasher + Default,
 {
     fn default() -> Self {
@@ -462,11 +460,7 @@ where
     }
 }
 
-impl<'a, K, V, S> IntoIterator for &'a HolyHashMap<K, V, S>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-{
+impl<'a, K, V, S> IntoIterator for &'a HolyHashMap<K, V, S> {
     type Item = (&'a K, &'a V);
     type IntoIter = Iter<'a, K, V>;
 
@@ -475,11 +469,7 @@ where
     }
 }
 
-impl<K, V, S> IntoIterator for HolyHashMap<K, V, S>
-where
-    K: Eq + Hash,
-    S: BuildHasher,
-{
+impl<K, V, S> IntoIterator for HolyHashMap<K, V, S> {
     type Item = (K, V);
     type IntoIter = IntoIter<K, V>;
 
@@ -717,6 +707,51 @@ impl<K, V> InnerMap<K, V> {
 
         entry
     }
+
+    pub fn iter(&self) -> Iter<K, V> {
+        Iter {
+            iter: self.entries.iter(),
+            tombstones: self.tombstones.len(),
+        }
+    }
+
+    pub fn iter_mut(&mut self) -> IterMut<K, V> {
+        IterMut {
+            iter: self.entries.iter_mut(),
+            tombstones: self.tombstones.len(),
+        }
+    }
+
+    pub fn keys(&self) -> Keys<K, V> {
+        Keys { iter: self.iter() }
+    }
+
+    pub fn values(&self) -> Values<K, V> {
+        Values { iter: self.iter() }
+    }
+
+    pub fn values_mut(&mut self) -> ValuesMut<K, V> {
+        ValuesMut {
+            iter: self.iter_mut(),
+        }
+    }
+
+    pub fn indices(&self) -> Indices<K, V> {
+        Indices {
+            iter: self.entries.iter().enumerate(),
+            tombstones: self.tombstones.len(),
+        }
+    }
+
+    /// Inserts a tombstone into the entries vector, leaving an empty slot.
+    /// Useful for retaining index stability upon serialization/deserialization.
+    #[cfg(feature = "serde")]
+    pub fn insert_tombstone(&mut self) -> EntryIndex {
+        let index = EntryIndex(self.entries.len());
+        self.entries.push(None);
+        self.tombstones.push(index);
+        index
+    }
 }
 
 impl<K, V> InnerMap<K, V>
@@ -790,16 +825,6 @@ where
         } else {
             Some(self.remove_bucket(index))
         }
-    }
-
-    /// Inserts a tombstone into the entries vector, leaving an empty slot.
-    /// Useful for retaining index stability upon serialization/deserialization.
-    #[cfg(feature = "serde")]
-    pub fn insert_tombstone(&mut self) -> EntryIndex {
-        let index = EntryIndex(self.entries.len());
-        self.entries.push(None);
-        self.tombstones.push(index);
-        index
     }
 
     /// Invariant: Space has already been reserved.
@@ -876,41 +901,6 @@ where
         self.buckets[bucket] = Bucket::new(hash, index);
 
         index
-    }
-
-    pub fn iter(&self) -> Iter<K, V> {
-        Iter {
-            iter: self.entries.iter(),
-            tombstones: self.tombstones.len(),
-        }
-    }
-
-    pub fn iter_mut(&mut self) -> IterMut<K, V> {
-        IterMut {
-            iter: self.entries.iter_mut(),
-            tombstones: self.tombstones.len(),
-        }
-    }
-
-    pub fn keys(&self) -> Keys<K, V> {
-        Keys { iter: self.iter() }
-    }
-
-    pub fn values(&self) -> Values<K, V> {
-        Values { iter: self.iter() }
-    }
-
-    pub fn values_mut(&mut self) -> ValuesMut<K, V> {
-        ValuesMut {
-            iter: self.iter_mut(),
-        }
-    }
-
-    pub fn indices(&self) -> Indices<K, V> {
-        Indices {
-            iter: self.entries.iter().enumerate(),
-            tombstones: self.tombstones.len(),
-        }
     }
 
     pub fn entry(&mut self, hash: HashValue, key: K) -> Entry<K, V> {

@@ -31,7 +31,7 @@ use {EntryIndex, HolyHashMap};
 
 impl<K, V, S> Serialize for HolyHashMap<K, V, S>
 where
-    K: Serialize + Hash + Eq,
+    K: Serialize,
     V: Serialize,
     S: BuildHasher,
 {
