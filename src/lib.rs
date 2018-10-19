@@ -1125,7 +1125,8 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
                         *tombstones -= 1;
                         None
                     }
-                }).nth(n)
+                })
+                .nth(n)
         }
     }
 }
@@ -1201,7 +1202,8 @@ impl<K, V> Iterator for IntoIter<K, V> {
                         *tombstones -= 1;
                         None
                     }
-                }).nth(n)
+                })
+                .nth(n)
         }
     }
 }
@@ -1279,7 +1281,8 @@ impl<'a, K, V> Iterator for IterMut<'a, K, V> {
                         *tombstones -= 1;
                         None
                     }
-                }).nth(n)
+                })
+                .nth(n)
         }
     }
 }
@@ -1490,7 +1493,8 @@ impl<'a, K, V> Iterator for Indices<'a, K, V> {
                         *tombstones -= 1;
                         None
                     }
-                }).nth(n)
+                })
+                .nth(n)
         }
     }
 }
