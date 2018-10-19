@@ -79,6 +79,12 @@ impl From<usize> for EntryIndex {
     }
 }
 
+impl Into<usize> for EntryIndex {
+    fn into(self) -> usize {
+        self.0
+    }
+}
+
 impl fmt::Display for EntryIndex {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.0)
