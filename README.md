@@ -1,5 +1,7 @@
 # holyhashmap
 
+[![Build Status](https://api.cirrus-ci.com/github/jasonwhite/holyhashmap.svg?branch=master)](https://cirrus-ci.com/github/jasonwhite/holyhashmap) [![Crates.io](https://img.shields.io/crates/v/holyhashmap.svg)](https://crates.io/crates/holyhashmap)
+
 A hash map whose entries can be indexed into. This is just like [indexmap][],
 but the indices are stable (i.e., indices are not perturbed upon removal of an
 entry). This makes it an ideal data structure for implementing graphs.
@@ -22,7 +24,7 @@ stable indices can be applied to any hash map implementation.
    [`HashMap`](https://doc.rust-lang.org/std/collections/struct.HashMap.html).
  * Inserting a key-value pair gives back an index to refer back to it. Using the
    index bypasses the need to compute the hash of the key.
- * Removing a key-value pair frees up the index that it was using it. A future
+ * Removing a key-value pair frees up the index that was using it. A future
    insertion will reuse the index. Thus, indices are not compact after a
    removal.
 
