@@ -508,7 +508,8 @@ where
     K: Eq + Hash,
     V: Eq,
     S: BuildHasher,
-{}
+{
+}
 
 impl<K, V, S> fmt::Debug for HolyHashMap<K, V, S>
 where
