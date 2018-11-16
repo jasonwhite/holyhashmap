@@ -805,12 +805,9 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let bucket = self.buckets.get(self.search(hash, key)).unwrap();
-
-        if bucket.is_empty() {
-            None
-        } else {
-            Some(bucket.index)
+        match self.search(hash, key) {
+            Search::Empty(_) => None,
+            Search::Exists(i) => Some(self.buckets.get(i).unwrap().index),
         }
     }
 
@@ -819,18 +816,17 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let bucket = self.buckets.get(self.search(hash, key)).unwrap();
-
-        if bucket.is_empty() {
-            None
-        } else {
-            Some(self.from_index(bucket.index).unwrap())
+        match self.search(hash, key) {
+            Search::Empty(_) => None,
+            Search::Exists(i) => Some(
+                self.from_index(self.buckets.get(i).unwrap().index).unwrap(),
+            ),
         }
     }
 
     /// Returns an index to a bucket where an entry has been found or can be
     /// inserted at.
-    pub fn search<Q>(&self, hash: HashValue, key: &Q) -> usize
+    pub fn search<Q>(&self, hash: HashValue, key: &Q) -> Search
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -841,12 +837,12 @@ where
             let bucket = self.buckets.get(i).unwrap();
 
             if bucket.is_empty() {
-                return i;
+                return Search::Empty(i);
             } else if bucket.hash == hash {
                 // The hash matches. Make sure the key actually matches.
                 let (k, _) = self.from_index(bucket.index).unwrap();
                 if k.borrow() == key {
-                    return i;
+                    return Search::Exists(i);
                 }
             }
 
@@ -857,7 +853,11 @@ where
 
     /// Returns an index to a bucket where an entry has been found or can be
     /// inserted at.
-    pub fn search_by_index(&self, hash: HashValue, index: EntryIndex) -> Search {
+    pub fn search_by_index(
+        &self,
+        hash: HashValue,
+        index: EntryIndex,
+    ) -> Search {
         let mut i = hash.index(self.mask);
 
         loop {
@@ -879,12 +879,9 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let index = self.search(hash, key);
-
-        if self.buckets[index].is_empty() {
-            None
-        } else {
-            Some(self.remove_bucket(index))
+        match self.search(hash, key) {
+            Search::Empty(_) => None,
+            Search::Exists(index) => Some(self.remove_bucket(index)),
         }
     }
 
@@ -906,20 +903,19 @@ where
         key: K,
         value: V,
     ) -> (EntryIndex, Option<V>) {
-        let i = self.search(hash, &key);
+        match self.search(hash, &key) {
+            Search::Empty(i) => (self.insert_new(i, hash, key, value), None),
+            Search::Exists(i) => {
+                let entry = Some((key, value));
 
-        if self.buckets[i].is_empty() {
-            (self.insert_new(i, hash, key, value), None)
-        } else {
-            let entry = Some((key, value));
+                // Already exists. Update it with the new value.
+                let index = self.buckets[i].index;
 
-            // Already exists. Update it with the new value.
-            let index = self.buckets[i].index;
+                let previous =
+                    mem::replace(self.raw_entry_mut(index), entry).unwrap();
 
-            let previous =
-                mem::replace(self.raw_entry_mut(index), entry).unwrap();
-
-            (index, Some(previous.1))
+                (index, Some(previous.1))
+            }
         }
     }
 
@@ -932,19 +928,20 @@ where
         key: K,
         value: V,
     ) -> (EntryIndex, Option<V>) {
-        let i = self.search(hash, &key);
-        let entry = Some((key, value));
-
-        if self.buckets[i].is_empty() {
-            let index = EntryIndex(self.entries.len());
-            self.entries.push(entry);
-            self.buckets[i] = Bucket::new(hash, index);
-            (index, None)
-        } else {
-            let index = self.buckets[i].index;
-            let previous =
-                mem::replace(self.raw_entry_mut(index), entry).unwrap();
-            (index, Some(previous.1))
+        match self.search(hash, &key) {
+            Search::Empty(i) => {
+                let index = EntryIndex(self.entries.len());
+                self.entries.push(Some((key, value)));
+                self.buckets[i] = Bucket::new(hash, index);
+                (index, None)
+            }
+            Search::Exists(i) => {
+                let index = self.buckets[i].index;
+                let previous =
+                    mem::replace(self.raw_entry_mut(index), Some((key, value)))
+                        .unwrap();
+                (index, Some(previous.1))
+            }
         }
     }
 
@@ -976,17 +973,16 @@ where
     }
 
     pub fn entry(&mut self, hash: HashValue, key: K) -> Entry<K, V> {
-        let index = self.search(hash, &key);
-
-        if self.buckets[index].is_empty() {
-            Entry::Vacant(VacantEntry {
+        match self.search(hash, &key) {
+            Search::Empty(index) => Entry::Vacant(VacantEntry {
                 map: self,
                 index,
                 hash,
                 key,
-            })
-        } else {
-            Entry::Occupied(OccupiedEntry { map: self, index })
+            }),
+            Search::Exists(index) => {
+                Entry::Occupied(OccupiedEntry { map: self, index })
+            }
         }
     }
 }
