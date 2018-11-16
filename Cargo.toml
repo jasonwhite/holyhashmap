@@ -1,7 +1,17 @@
 [package]
 name = "holyhashmap"
 version = "0.1.0"
-authors = ["Jason White <jwhite@esri.com>"]
+authors = ["Jason White"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/jasonwhite/holyhashmap"
+documentation = "https://docs.rs/holyhashmap"
+homepage = "https://github.com/jasonwhite/holyhashmap"
+description = """
+A hash map with stable indices.
+"""
+keywords = ["hashmap"]
+categories = ["data-structures"]
 
 [dependencies]
 serde = { version = "1", optional = true }
