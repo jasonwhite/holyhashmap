@@ -8,7 +8,7 @@ entry). This makes it an ideal data structure for implementing graphs.
 
 The underlying hash map implementation ([linear probing][]) is not particularly
 fast or smart. I'm more interested in the stable indices property than having a
-super-fast hash map at the moment. However, I'd be great to switch to either
+super-fast hash map at the moment. However, it'd be great to switch to either
 [Robin Hood Hashing][] or to the [SwissTable approach][hashbrown]. The idea of
 stable indices can be applied to any hash map implementation.
 
