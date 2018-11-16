@@ -353,6 +353,32 @@ where
         result
     }
 
+    /// Removes an entry by its index. Returns `None` if the index is invalid.
+    ///
+    /// Note that this may not be any faster than calling `remove` or
+    /// `remove_entry`. We must still calculate the hash of the key in order to
+    /// remove the entry.
+    pub fn remove_index(&mut self, index: EntryIndex) -> Option<(K, V)> {
+        if self.is_empty() {
+            // Can't compute hash index for empty map.
+            return None;
+        }
+
+        if let Some(hash) = self
+            .from_index(index)
+            .map(|(k, _)| HashValue::new(&self.hash_builder, k))
+        {
+            let result = self.inner.remove_index(hash, index);
+
+            #[cfg(test)]
+            self.check_consistency();
+
+            result
+        } else {
+            None
+        }
+    }
+
     #[inline]
     pub fn entry(&mut self, key: K) -> Entry<K, V> {
         self.reserve(1);
@@ -564,6 +590,15 @@ impl Bucket {
     pub fn index(&self, mask: usize) -> usize {
         self.hash.index(mask)
     }
+}
+
+/// A search result.
+enum Search {
+    /// The bucket is empty and we can insert here.
+    Empty(usize),
+
+    /// The bucket is occupied.
+    Exists(usize),
 }
 
 impl<K, V> InnerMap<K, V> {
@@ -820,6 +855,25 @@ where
         }
     }
 
+    /// Returns an index to a bucket where an entry has been found or can be
+    /// inserted at.
+    pub fn search_by_index(&self, hash: HashValue, index: EntryIndex) -> Search {
+        let mut i = hash.index(self.mask);
+
+        loop {
+            let bucket = self.buckets.get(i).unwrap();
+
+            if bucket.is_empty() {
+                return Search::Empty(i);
+            } else if bucket.hash == hash && bucket.index == index {
+                return Search::Exists(i);
+            }
+
+            // Wrap around to the beginning of the array if necessary.
+            i = i.wrapping_add(1) & self.mask;
+        }
+    }
+
     pub fn remove<Q>(&mut self, hash: HashValue, key: &Q) -> Option<(K, V)>
     where
         K: Borrow<Q>,
@@ -831,6 +885,17 @@ where
             None
         } else {
             Some(self.remove_bucket(index))
+        }
+    }
+
+    pub fn remove_index(
+        &mut self,
+        hash: HashValue,
+        index: EntryIndex,
+    ) -> Option<(K, V)> {
+        match self.search_by_index(hash, index) {
+            Search::Empty(_) => None,
+            Search::Exists(i) => Some(self.remove_bucket(i)),
         }
     }
 
@@ -2146,5 +2211,25 @@ mod test {
         assert_eq!(map.entry(3).index(), EntryIndex(4));
         map.insert(5, 50);
         assert_eq!(map.entry(3).index(), EntryIndex(2));
+    }
+
+    #[test]
+    fn test_remove_index() {
+        let mut map = HashMap::new();
+
+        let one = map.insert_full(1, 10).0;
+        let two = map.insert_full(2, 20).0;
+        let three = map.insert_full(3, 30).0;
+
+        let xs = [(4, 40), (5, 50), (6, 60)];
+        map.extend(xs.iter().cloned());
+
+        assert_eq!(map.len(), 6);
+
+        assert_eq!(map.remove_index(one), Some((1, 10)));
+        assert_eq!(map.remove_index(two), Some((2, 20)));
+        assert_eq!(map.remove_index(three), Some((3, 30)));
+
+        assert_eq!(map.len(), 3);
     }
 }
