@@ -11,7 +11,7 @@ clippy_task:
     image: rustlang/rust:nightly
   cargo_cache:
     folder: $CARGO_HOME/registry
-    fingerprint_script: cat Cargo.lock
+    fingerprint_script: cat Cargo.toml
   install_script: rustup component add clippy-preview
   check_script: cargo clippy
   before_cache_script: rm -rf $CARGO_HOME/registry/index
@@ -26,7 +26,7 @@ test_task:
         image: rustlang/rust:nightly
   cargo_cache:
     folder: $CARGO_HOME/registry
-    fingerprint_script: cat Cargo.lock
+    fingerprint_script: cat Cargo.toml
   build_script: cargo build
   test_script: cargo test
   before_cache_script: rm -rf $CARGO_HOME/registry/index
