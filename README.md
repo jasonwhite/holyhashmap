@@ -42,7 +42,7 @@ and this to your crate root:
 extern crate holyhashmap;
 ```
 
-For [serde](https://serde.rs/) support, add this instead to your crate root:
+For [serde](https://serde.rs/) support, add this instead to your `Cargo.toml`:
 
 ```toml
 [dependencies]
