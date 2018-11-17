@@ -107,7 +107,7 @@ impl HashValue {
 
     /// Returns the index into which this hash value should go given an array
     /// length.
-    pub fn index(&self, mask: usize) -> usize {
+    pub fn index(self, mask: usize) -> usize {
         debug_assert!(
             mask.wrapping_add(1).is_power_of_two(),
             format!("invalid mask {:x?}", mask)
@@ -673,7 +673,7 @@ impl<K, V> InnerMap<K, V> {
 
             // Probe for an empty bucket and place it there.
             loop {
-                let mut candidate = self.buckets.get_mut(index).unwrap();
+                let mut candidate = &mut self.buckets[index];
 
                 if candidate.is_empty() {
                     *candidate = bucket;
@@ -702,11 +702,11 @@ impl<K, V> InnerMap<K, V> {
     }
 
     fn raw_entry_mut(&mut self, index: EntryIndex) -> &mut Option<(K, V)> {
-        self.entries.get_mut(index.0).unwrap()
+        &mut self.entries[index.0]
     }
 
     fn set_raw_entry(&mut self, index: EntryIndex, entry: Option<(K, V)>) {
-        *self.entries.get_mut(index.0).unwrap() = entry;
+        self.entries[index.0] = entry;
     }
 
     // Removes an existing bucket.
@@ -715,7 +715,7 @@ impl<K, V> InnerMap<K, V> {
     pub fn remove_bucket(&mut self, index: usize) -> (K, V) {
         // Remove the bucket, leaving an empty bucket in its place.
         let removed =
-            mem::replace(self.buckets.get_mut(index).unwrap(), Bucket::EMPTY);
+            mem::replace(&mut self.buckets[index], Bucket::EMPTY);
 
         // Found the entry. Remove it and update the tombstone list.
         let entry = self.raw_entry_mut(removed.index).take().unwrap();
@@ -807,7 +807,7 @@ where
     {
         match self.search(hash, key) {
             Search::Empty(_) => None,
-            Search::Exists(i) => Some(self.buckets.get(i).unwrap().index),
+            Search::Exists(i) => Some(self.buckets[i].index),
         }
     }
 
@@ -819,7 +819,7 @@ where
         match self.search(hash, key) {
             Search::Empty(_) => None,
             Search::Exists(i) => Some(
-                self.from_index(self.buckets.get(i).unwrap().index).unwrap(),
+                self.from_index(self.buckets[i].index).unwrap(),
             ),
         }
     }
@@ -834,7 +834,7 @@ where
         let mut i = hash.index(self.mask);
 
         loop {
-            let bucket = self.buckets.get(i).unwrap();
+            let bucket = &self.buckets[i];
 
             if bucket.is_empty() {
                 return Search::Empty(i);
@@ -861,7 +861,7 @@ where
         let mut i = hash.index(self.mask);
 
         loop {
-            let bucket = self.buckets.get(i).unwrap();
+            let bucket = &self.buckets[i];
 
             if bucket.is_empty() {
                 return Search::Empty(i);
@@ -1182,7 +1182,7 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
             self.iter
                 .by_ref()
                 .filter_map(move |entry| match entry {
-                    Some((k, v)) => return Some((k, v)),
+                    Some((k, v)) => Some((k, v)),
                     None => {
                         *tombstones -= 1;
                         None
@@ -1259,7 +1259,7 @@ impl<K, V> Iterator for IntoIter<K, V> {
             self.iter
                 .by_ref()
                 .filter_map(move |entry| match entry {
-                    Some(e) => return Some(e),
+                    Some(e) => Some(e),
                     None => {
                         *tombstones -= 1;
                         None
@@ -1338,7 +1338,7 @@ impl<'a, K, V> Iterator for IterMut<'a, K, V> {
             self.iter
                 .by_ref()
                 .filter_map(move |entry| match entry {
-                    Some((ref k, ref mut v)) => return Some((k, v)),
+                    Some((ref k, ref mut v)) => Some((k, v)),
                     None => {
                         *tombstones -= 1;
                         None
@@ -1550,7 +1550,7 @@ impl<'a, K, V> Iterator for Indices<'a, K, V> {
             self.iter
                 .by_ref()
                 .filter_map(move |(i, entry)| match entry {
-                    Some(_) => return Some(EntryIndex(i)),
+                    Some(_) => Some(EntryIndex(i)),
                     None => {
                         *tombstones -= 1;
                         None
@@ -1681,7 +1681,7 @@ mod test {
                 slot.borrow_mut()[k] += 1;
             });
 
-            Droppable { k: k }
+            Droppable { k }
         }
     }
 
