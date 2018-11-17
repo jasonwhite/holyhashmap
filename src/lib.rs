@@ -714,8 +714,7 @@ impl<K, V> InnerMap<K, V> {
     // Precondition: The bucket is not empty.
     pub fn remove_bucket(&mut self, index: usize) -> (K, V) {
         // Remove the bucket, leaving an empty bucket in its place.
-        let removed =
-            mem::replace(&mut self.buckets[index], Bucket::EMPTY);
+        let removed = mem::replace(&mut self.buckets[index], Bucket::EMPTY);
 
         // Found the entry. Remove it and update the tombstone list.
         let entry = self.raw_entry_mut(removed.index).take().unwrap();
@@ -818,9 +817,9 @@ where
     {
         match self.search(hash, key) {
             Search::Empty(_) => None,
-            Search::Exists(i) => Some(
-                self.from_index(self.buckets[i].index).unwrap(),
-            ),
+            Search::Exists(i) => {
+                Some(self.from_index(self.buckets[i].index).unwrap())
+            }
         }
     }
 
