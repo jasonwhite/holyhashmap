@@ -1,6 +1,6 @@
 [package]
 name = "holyhashmap"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Jason White"]
 license = "MIT"
 readme = "README.md"
