@@ -23,7 +23,7 @@ extern crate quickcheck;
 
 use holyhashmap::HolyHashMap;
 
-quickcheck!{
+quickcheck! {
     fn contains(insert: Vec<u32>) -> bool {
         let mut map = HolyHashMap::new();
         for &key in insert.iter() {
