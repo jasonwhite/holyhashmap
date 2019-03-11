@@ -83,3 +83,9 @@ where
 ## License
 
 [MIT license](LICENSE)
+
+## Thanks
+
+This was developed at [Environmental Systems Research
+Institute](http://www.esri.com/) (Esri) who have graciously allowed me to retain
+the copyright and publish it as open source software.
