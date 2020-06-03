@@ -38,12 +38,6 @@ Add this to your `Cargo.toml`
 holyhashmap = "0.1"
 ```
 
-and this to your crate root:
-
-```rust
-extern crate holyhashmap;
-```
-
 For [serde](https://serde.rs/) support, add this instead to your `Cargo.toml`:
 
 ```toml
